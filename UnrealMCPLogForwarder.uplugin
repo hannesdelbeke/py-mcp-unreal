@@ -6,6 +6,10 @@
   "Description": "Forwards Unreal logs to an MCP server using Python.",
   "Category": "Python",
   "EnabledByDefault": true,
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "IsExperimentalVersion": true,
+  "Installed": false,
   "Modules": [],
   "Plugins": [
     {
