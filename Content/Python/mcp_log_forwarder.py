@@ -27,6 +27,13 @@ _CACHED_SEARCH = None
 _MAIN_THREAD_QUEUE = []
 _MAIN_THREAD_LOCK = threading.Lock()
 _MAIN_THREAD_INIT = False
+_MAIN_THREAD_READY = False
+
+_TICK_HANDLE = None
+_TICK_KIND = None  # "post" or "pre"
+
+_SERVER = None
+_SERVER_THREAD = None
 
 
 def _log_info(msg):
@@ -51,13 +58,15 @@ def _log_error(msg):
 
 def _ensure_main_thread_runner():
     """Register a tick callback to run queued work on the editor main thread."""
-    global _MAIN_THREAD_INIT
+    global _MAIN_THREAD_INIT, _MAIN_THREAD_READY
+    global _TICK_HANDLE, _TICK_KIND
 
     if _MAIN_THREAD_INIT:
         return
 
     if unreal is None:
         _MAIN_THREAD_INIT = True
+        _MAIN_THREAD_READY = False
         return
 
     # Many Unreal Python builds expose register_slate_post_tick_callback.
@@ -68,6 +77,7 @@ def _ensure_main_thread_runner():
     if register is None:
         _log_error("No Slate tick callback registration found; cannot run exec on main thread.")
         _MAIN_THREAD_INIT = True
+        _MAIN_THREAD_READY = False
         return
 
     def _tick(_delta_time):
@@ -83,12 +93,15 @@ def _ensure_main_thread_runner():
                 _log_error(f"Main-thread task failed: {e}")
 
     try:
-        register(_tick)
+        _TICK_HANDLE = register(_tick)
+        _TICK_KIND = "post" if getattr(unreal, "register_slate_post_tick_callback", None) is register else "pre"
         _MAIN_THREAD_INIT = True
+        _MAIN_THREAD_READY = True
         _log_info("Main-thread runner registered via Slate tick callback")
     except Exception as e:
         _log_error(f"Failed to register main-thread runner: {e}")
         _MAIN_THREAD_INIT = True
+        _MAIN_THREAD_READY = False
 
 
 def _get_project_name():
@@ -362,7 +375,7 @@ def exec_python(code, mode="exec"):
     _ensure_main_thread_runner()
 
     # If we cannot schedule, run directly (may fail for editor APIs).
-    if unreal is None or not _MAIN_THREAD_INIT:
+    if unreal is None or not _MAIN_THREAD_READY:
         return _run()
 
     done = threading.Event()
@@ -387,6 +400,68 @@ def exec_python(code, mode="exec"):
         }
 
     return out
+
+
+def _port_is_open(host, port, timeout=0.15):
+    try:
+        import socket
+
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _stop_server():
+    global _SERVER, _SERVER_THREAD
+
+    srv = _SERVER
+    thr = _SERVER_THREAD
+    _SERVER = None
+    _SERVER_THREAD = None
+
+    if srv is not None:
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+
+    if thr is not None:
+        try:
+            thr.join(timeout=1.0)
+        except Exception:
+            pass
+
+
+def _unregister_tick():
+    global _TICK_HANDLE, _TICK_KIND
+
+    if unreal is None:
+        _TICK_HANDLE = None
+        _TICK_KIND = None
+        return
+
+    handle = _TICK_HANDLE
+    kind = _TICK_KIND
+    _TICK_HANDLE = None
+    _TICK_KIND = None
+
+    if handle is None or kind is None:
+        return
+
+    try:
+        if kind == "post":
+            unreg = getattr(unreal, "unregister_slate_post_tick_callback", None)
+        else:
+            unreg = getattr(unreal, "unregister_slate_pre_tick_callback", None)
+        if unreg is not None:
+            unreg(handle)
+    except Exception:
+        pass
 
 # The MCP Tool Definition (for discovery)
 MCP_TOOLS = {
@@ -534,6 +609,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 # Helper to run server in its own thread
 def start_mcp_server():
     """Starts the MCP HTTP server in a thread."""
+    global _SERVER
     try:
         # Use a non-default thread class that is properly daemonized
         class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -544,6 +620,7 @@ def start_mcp_server():
 
         # We bind to 0.0.0.0 to listen on all interfaces
         server = ThreadingHTTPServer(("127.0.0.1", MCP_PORT), MCPHandler)
+        _SERVER = server
         _log_info(f"Starting MCP Server (File Reader) on port {MCP_PORT}...")
         server.serve_forever()
     except Exception as e:
@@ -551,6 +628,10 @@ def start_mcp_server():
 
 # Start the server in a separate daemon thread
 if os.getenv("UNREAL_MCP_DISABLE_SERVER") != "1":
-    _server_thread = threading.Thread(target=start_mcp_server, daemon=True)
-    _server_thread.start()
+    # On module reload, stop any existing server first.
+    _stop_server()
+    _unregister_tick()
+
+    _SERVER_THREAD = threading.Thread(target=start_mcp_server, daemon=True)
+    _SERVER_THREAD.start()
     _log_info(f"MCP Log Forwarder (Server Thread) started on port {MCP_PORT}. Access via http://localhost:{MCP_PORT}")
