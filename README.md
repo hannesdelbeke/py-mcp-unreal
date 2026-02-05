@@ -6,6 +6,10 @@
 - ✅ MCP server implemented (mcp_log_forwarder.py)
 - 🔧 Auto-startup fix applied - CanContainContent added
 
+## Log Source
+This plugin reads logs from the Unreal on-disk log file (tailing the last N lines):
+`C:\\Users\\hannes\\AppData\\Local\\UnrealEngine\\5.6\\Saved\\Logs\\Test.log`
+
 ## Solution Applied
 Added `CanContainContent: true` to plugin configuration - this is the critical requirement for Unreal Engine to auto-execute Python scripts in plugin's Content/Python folder.
 

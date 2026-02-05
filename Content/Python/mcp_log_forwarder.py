@@ -3,42 +3,74 @@ import threading
 import json
 import http.server
 import socketserver
-from typing import List
+import os
 
 # --- Configuration ---
 MCP_PORT = 3001
-LOG_LINE_LIMIT = 5000  # Max lines to store in memory
-RETURN_LOG_LINES = 500 # Default lines to return per tool call
+LOG_FILE_PATH = "C:\\Users\\hannes\\AppData\\Local\\UnrealEngine\\5.6\\Saved\\Logs\\Test.log"
+RETURN_LOG_LINES = 500  # Default lines to return per tool call
+LOG_LINE_LIMIT = 5000  # Safety cap on returned lines
 
-# --- Shared Log Buffer ---
-_log_buffer: List[str] = []
-_buffer_lock = threading.Lock()
+# --- Log Tailing Utility ---
 
-# --- Unreal Log Capture ---
+def tail_log_file(filename, n=RETURN_LOG_LINES):
+    """Return last n lines from filename.
 
-class UnrealLogCapturer(unreal.OutputDevice):
-    """Custom Unreal output device that captures log lines."""
-    def serialize(self, message: str, verbosity: unreal.LogVerbosity, category: unreal.Name):
-        # We must acquire the lock before doing anything with the shared buffer
-        with _buffer_lock:
-            # Format and append log
-            formatted = f"[{category.text}] {verbosity.name}: {message}"
-            _log_buffer.append(formatted)
-            
-            # Enforce buffer size limit by keeping only the last LOG_LINE_LIMIT lines
-            if len(_log_buffer) > LOG_LINE_LIMIT:
-                _log_buffer[:] = _log_buffer[-LOG_LINE_LIMIT:]
+    Implementation reads chunks from EOF backwards to avoid loading the whole file.
+    """
+    try:
+        # Check if the file exists before attempting to open
+        if not os.path.exists(filename):
+            unreal.log_error(f"Log file not found at: {filename}")
+            return [f"ERROR: Log file not found at {filename}"]
 
-# Register device when the script runs
-_capturer = UnrealLogCapturer()
-unreal.register_output_device(_capturer)
-unreal.log(f"MCP Log Forwarder (UnrealLogCapturer) loaded. Max buffer size: {LOG_LINE_LIMIT} lines.")
+        with open(filename, "rb") as f:
+            # Move the file pointer to the end
+            f.seek(0, os.SEEK_END)
+
+            block_size = 8192
+            buf = b""
+            lines = []
+            pos = f.tell()
+
+            while len(lines) <= n and pos > 0:
+                read_start = max(0, pos - block_size)
+                f.seek(read_start)
+                chunk = f.read(pos - read_start)
+                pos = read_start
+
+                buf = chunk + buf
+                parts = buf.split(b"\n")
+
+                # keep first (possibly partial) line in buf, consume full lines
+                buf = parts[0]
+                full_lines = parts[1:]
+
+                # add consumed lines to list (as bytes)
+                for bline in reversed(full_lines):
+                    if bline:
+                        lines.append(bline)
+                        if len(lines) >= n:
+                            break
+
+            # lines currently reversed (newest-first)
+            out = []
+            for bline in reversed(lines[:n]):
+                try:
+                    out.append(bline.decode("utf-8", errors="ignore"))
+                except Exception:
+                    out.append(str(bline))
+            return out
+
+    except Exception as e:
+        unreal.log_error(f"Error reading log file: {e}")
+        return [f"ERROR: Could not read log file: {e}"]
 
 
 # --- MCP Tool Implementation ---
 
-def get_logs(limit: int = RETURN_LOG_LINES) -> List[str]:
-    """Retrieves the most recent Unreal Engine log entries."""
+def get_logs(limit=RETURN_LOG_LINES):
+    """Retrieves the most recent Unreal Engine log entries from the file."""
     # Ensure limit is an integer and within the safe bounds
     try:
         limit = int(limit)
@@ -47,21 +79,19 @@ def get_logs(limit: int = RETURN_LOG_LINES) -> List[str]:
         
     limit = max(1, min(limit, LOG_LINE_LIMIT))
     
-    with _buffer_lock:
-        # Return the last 'limit' lines
-        return _log_buffer[-limit:]
+    return tail_log_file(LOG_FILE_PATH, limit)
 
 # The MCP Tool Definition (for discovery)
 MCP_TOOLS = {
     "unreal_logs/get_logs": {
-        "description": "Retrieves the most recent Unreal Engine log entries. Default limit is 500 lines.",
+        "description": f"Retrieves the most recent Unreal Engine log entries from {LOG_FILE_PATH}. Default limit is 500 lines.",
         "function": get_logs,
         "parameters": {
             "type": "object",
             "properties": {
                 "limit": {
                     "type": "integer",
-                    "description": "The maximum number of log lines to return (default 500, max 5000)."
+                    "description": f"The maximum number of log lines to return (default {RETURN_LOG_LINES}, max {LOG_LINE_LIMIT})."
                 }
             }
         }
@@ -112,12 +142,15 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 tool_data = MCP_TOOLS.get(tool_name)
                 if tool_data and tool_data["function"]:
                     # Call the function with arguments
-                    # Filter out arguments not expected by the function to prevent TypeError
-                    import inspect
-                    func_params = inspect.signature(tool_data["function"]).parameters
-                    filtered_arguments = {k: v for k, v in arguments.items() if k in func_params}
-                    
-                    result = tool_data["function"](**filtered_arguments)
+                    try:
+                        import inspect
+                        func_params = inspect.signature(tool_data["function"]).parameters
+                        filtered_arguments = {k: v for k, v in arguments.items() if k in func_params}
+                        
+                        result = tool_data["function"](**filtered_arguments)
+                    except (TypeError, AttributeError):
+                        # Fallback for older Python versions or inspect issues
+                        result = tool_data["function"](**arguments)
                     
                     self.send_response(200)
                     self.send_header("Content-type", "application/json")
@@ -157,9 +190,12 @@ def start_mcp_server():
         class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
             pass
 
-        # We bind to 0.0.0.0 to listen on all interfaces, but it's only for localhost access
-        server = ThreadingHTTPServer(("0.0.0.0", MCP_PORT), MCPHandler)
-        unreal.log(f"Starting MCP Server on port {MCP_PORT}...")
+        ThreadingHTTPServer.daemon_threads = True
+        ThreadingHTTPServer.allow_reuse_address = True
+
+        # We bind to 0.0.0.0 to listen on all interfaces
+        server = ThreadingHTTPServer(("127.0.0.1", MCP_PORT), MCPHandler)
+        unreal.log(f"Starting MCP Server (File Reader) on port {MCP_PORT}...")
         server.serve_forever()
     except Exception as e:
         unreal.log_error(f"Failed to start MCP Server (Port {MCP_PORT} in use?): {e}")
