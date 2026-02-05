@@ -251,6 +251,69 @@ def get_log_path(path=None):
         },
     }
 
+
+def exec_python(code, mode="exec"):
+    """Execute Python inside Unreal and return output.
+
+    Parameters:
+    - code: python source code
+    - mode: "exec" (default) or "eval"
+    """
+
+    if unreal is None:
+        return {
+            "ok": False,
+            "error": "unreal module not available",
+        }
+
+    if code is None:
+        return {
+            "ok": False,
+            "error": "Missing required argument: code",
+        }
+
+    try:
+        code_str = str(code)
+    except Exception:
+        code_str = code
+
+    # capture stdout/stderr
+    import io
+    import contextlib
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    g = {"unreal": unreal}
+    l = {}
+
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            if mode == "eval":
+                result = eval(code_str, g, l)
+            else:
+                exec(code_str, g, l)
+                result = l.get("result", None)
+
+        return {
+            "ok": True,
+            "mode": mode,
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "result": result,
+        }
+    except Exception as e:
+        import traceback
+
+        return {
+            "ok": False,
+            "mode": mode,
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }
+
 # The MCP Tool Definition (for discovery)
 MCP_TOOLS = {
     "unreal_logs/get_logs": {
@@ -281,6 +344,25 @@ MCP_TOOLS = {
                     "description": "Optional absolute path to test as the log file path."
                 }
             }
+        }
+    }
+    ,
+    "unreal_logs/exec": {
+        "description": "Execute arbitrary Python in the running Unreal Editor process. Returns stdout/stderr/result.",
+        "function": exec_python,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source code to execute."
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Execution mode: 'exec' (default) or 'eval'."
+                }
+            },
+            "required": ["code"]
         }
     }
 }
