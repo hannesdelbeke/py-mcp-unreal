@@ -1,5 +1,19 @@
 # UnrealMCPLogForwarder
 
+So I know nothing about networking, or MCP servers, but managed to make a MCP server with AI, so your AI can to talk with Unreal.
+- read the log
+- send python commands
+There are no pre programmed commands like get actor, or blueprint or scene commands. it fully relies on your AI using python commands. no guard rails.
+Note that not everything is exposed in python in unreal, so there might be limits.
+
+<img width="1394" height="429" alt="image" src="https://github.com/user-attachments/assets/c9f9d773-cb35-4937-a800-f16cf6b8f9f8" />
+I asked GPT to create a small maze with cubes, and it did so.
+
+For now I mostly plan to use this to ask AI, what went wrong check the log. to avoid need to copy paste log myself.
+everything below here is AI generated
+
+---
+
 Expose a small MCP HTTP server inside the Unreal Editor so OpenCode can:
 
 - Read the latest Unreal log lines (tail the log file)
