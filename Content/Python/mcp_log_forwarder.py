@@ -277,42 +277,56 @@ def exec_python(code, mode="exec"):
     except Exception:
         code_str = code
 
-    # capture stdout/stderr
     import io
     import contextlib
 
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    def _run():
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        g = {"unreal": unreal}
+        l = {}
 
-    g = {"unreal": unreal}
-    l = {}
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                if mode == "eval":
+                    result = eval(code_str, g, l)
+                else:
+                    exec(code_str, g, l)
+                    result = l.get("result", None)
+
+            return {
+                "ok": True,
+                "mode": mode,
+                "stdout": stdout.getvalue(),
+                "stderr": stderr.getvalue(),
+                "result": result,
+            }
+        except Exception as e:
+            import traceback
+            return {
+                "ok": False,
+                "mode": mode,
+                "stdout": stdout.getvalue(),
+                "stderr": stderr.getvalue(),
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
+
+    # Unreal editor APIs generally must run on the main thread.
+    # Use a safe main-thread execution helper when available.
+    try:
+        if hasattr(unreal, "PythonBPLib") and hasattr(unreal.PythonBPLib, "execute_python_command"):
+            # Best-effort fallback; no stdout capture.
+            ok = unreal.PythonBPLib.execute_python_command(code_str)
+            return {"ok": bool(ok), "mode": mode, "stdout": "", "stderr": "", "result": None}
+    except Exception:
+        pass
 
     try:
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            if mode == "eval":
-                result = eval(code_str, g, l)
-            else:
-                exec(code_str, g, l)
-                result = l.get("result", None)
-
-        return {
-            "ok": True,
-            "mode": mode,
-            "stdout": stdout.getvalue(),
-            "stderr": stderr.getvalue(),
-            "result": result,
-        }
-    except Exception as e:
-        import traceback
-
-        return {
-            "ok": False,
-            "mode": mode,
-            "stdout": stdout.getvalue(),
-            "stderr": stderr.getvalue(),
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-        }
+        return unreal.run_on_main_thread(_run)
+    except Exception:
+        # If run_on_main_thread isn't available, run directly (may fail for editor APIs).
+        return _run()
 
 # The MCP Tool Definition (for discovery)
 MCP_TOOLS = {
