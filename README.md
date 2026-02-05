@@ -1,17 +1,14 @@
 # UnrealMCPLogForwarder
-
-I don't know much about networking or MCP servers, but I managed to build a small MCP-like server with GPT-5.2 (Github copilot free tier) in 3 hours🚀.
-
-It lets an AI talk to Unreal by:
-
+A pure Python Unreal plugin containing a MCP-like server that lets an AI/LLM talk to Unreal by:  
 - Reading Unreal's Output Log
 - Sending Python code to execute in Unreal
 
-There are no pre-programmed commands (e.g. "get actor" / blueprint helpers / scene commands). It fully relies on your AI writing Python, with no guardrails.
+There are no pre-programmed commands, it fully relies on your AI executing Unreal Python commands, with no guardrails.
 There may be limits, since Unreal does not expose everything to Python.
 
 <img width="1394" height="429" alt="image" src="https://github.com/user-attachments/assets/c9f9d773-cb35-4937-a800-f16cf6b8f9f8" />
-I asked GPT to create a small maze with cubes, and it did so.
+
+_I asked GPT to create a small maze with cubes_
 
 For now, I mostly plan to use this to ask an AI "what went wrong?" by checking the log, without having to copy/paste it manually.
 Everything below is AI-generated (with light edits).
