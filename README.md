@@ -18,10 +18,7 @@ _Asked to create a new red material and apply it to actor MCP_Maze_6_6_
 
 ---
 
-For now, I mostly plan to use this to ask an AI "what went wrong?" by checking the log, without having to copy/paste it manually.
-Everything below is AI-generated (with light edits).
-
----
+<!-- All text below is AI-generated. -->
 
 Expose a small MCP-like HTTP server inside the Unreal Editor so OpenCode can:
 
