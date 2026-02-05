@@ -6,9 +6,17 @@ A pure Python Unreal plugin containing a MCP-like server that lets an AI/LLM tal
 There are no pre-programmed commands, it fully relies on your AI executing Unreal Python commands, with no guardrails.
 There may be limits, since Unreal does not expose everything to Python.
 
+## Examples
+
 <img width="1394" height="429" alt="image" src="https://github.com/user-attachments/assets/c9f9d773-cb35-4937-a800-f16cf6b8f9f8" />
 
-_I asked GPT to create a small maze with cubes_
+_Asked GPT to create a small maze with cubes_
+
+<img width="967" height="376" alt="image" src="https://github.com/user-attachments/assets/6de6917f-36a8-48f7-ae23-d5ca87788d5b" />
+
+_Asked to create a new red material and apply it to actor MCP_Maze_6_6_
+
+---
 
 For now, I mostly plan to use this to ask an AI "what went wrong?" by checking the log, without having to copy/paste it manually.
 Everything below is AI-generated (with light edits).
