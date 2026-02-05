@@ -1,37 +1,91 @@
-# Unreal MCP Log Forwarder Plugin
+# UnrealMCPLogForwarder
 
-## Plugin Status
-- ✅ Plugin structure created
-- ✅ Git repository initialized
-- ✅ MCP server implemented (mcp_log_forwarder.py)
-- 🔧 Auto-startup fix applied - CanContainContent added
+Expose a small MCP HTTP server inside the Unreal Editor so OpenCode can:
 
-## Log Source
-This plugin resolves the current Unreal log file dynamically (tailing the last N lines):
+- Read the latest Unreal log lines (tail the log file)
+- Execute arbitrary Python in the running Unreal Editor (for inspection / automation)
 
-- Preferred: `<Project>/Saved/Logs/*.log`
-- Fallbacks on Windows:
-  - `%LOCALAPPDATA%\\UnrealEngine\\*\\Saved\\Logs\\*.log`
-  - `%LOCALAPPDATA%\\<ProjectName>\\Saved\\Logs\\*.log`
+This is a project plugin. Unreal runs `Content/Python/init_unreal.py` automatically when the plugin is enabled.
+
+## What You Get
+
+An HTTP server bound to `127.0.0.1:3001` (configurable) with MCP-like endpoints:
+
+- `GET /mcp` tool discovery
+- `POST /mcp/messages` tool execution
+
+Tools:
+
+- `unreal_logs/get_logs` - return last N lines of the Unreal log
+- `unreal_logs/get_log_path` - show which log file is being used + search paths
+- `unreal_logs/exec` - run Python code inside Unreal and return stdout / result
+
+## Install (Project Plugin)
+
+1. Copy this folder to your project:
+
+   `<ProjectRoot>/Plugins/UnrealMCPLogForwarder`
+
+2. In Unreal Editor:
+
+   `Edit -> Plugins` and enable `MCP Log Forwarder`.
+
+3. Restart the Unreal Editor.
+
+You should see startup logs indicating the server started.
+
+## Configure OpenCode
+
+Add this to your OpenCode config (global example on Windows):
+
+`C:\Users\hannes\.config\opencode\opencode.json`
+
+```json
+{
+  "mcp": {
+    "unreal_logs": {
+      "type": "remote",
+      "url": "http://localhost:3001",
+      "enabled": true
+    }
+  }
+}
+```
+
+Restart OpenCode.
+
+## Usage
+
+In OpenCode prompts:
+
+- Read logs:
+  - `use unreal_logs/get_logs with limit=200`
+- Verify what log file is being tailed:
+  - `use unreal_logs/get_log_path`
+- Execute Python inside Unreal:
+  - `use unreal_logs/exec with code="print('hello from unreal')"`
+  - `use unreal_logs/exec with code="import unreal; unreal.EditorLevelLibrary.get_all_level_actors()"`
+
+## Log Path Resolution
+
+The plugin auto-detects the current log file:
+
+1. Preferred: `<Project>/Saved/Logs/*.log` (via Unreal API)
+2. Windows fallback: `%LOCALAPPDATA%\UnrealEngine\*\Saved\Logs\*.log`
+3. Windows fallback: `%LOCALAPPDATA%\<ProjectName>\Saved\Logs\*.log`
 
 Overrides:
-- Env var: `UNREAL_MCP_LOG_PATH` (absolute path to a specific log file)
-- Tool arg: `path` (per-call override)
 
-## Solution Applied
-Added `CanContainContent: true` to plugin configuration - this is the critical requirement for Unreal Engine to auto-execute Python scripts in plugin's Content/Python folder.
+- Env var: `UNREAL_MCP_LOG_PATH` (absolute path to a specific `.log` file)
+- Tool arg: `path` (per-call override for `get_logs` / `get_log_path`)
 
-## Required Steps
-1. **Restart Unreal Editor** - Plugin configuration changes require a full restart
-2. **Check Output Log** - Look for debug messages from the init_unreal.py script
-3. **Test MCP Server** - Verify server starts on port 3001
+## Security Notes
 
-## Test Results (Pre-Fix)
-- Plugin is loaded in Unreal Editor
-- MCP server not accessible on port 3001
-- Python startup script not executing automatically
+- The server binds to `127.0.0.1` only.
+- `unreal_logs/exec` is intentionally powerful: it runs arbitrary Python in the Editor process.
+  Only use this on trusted machines and do not expose the port to the network.
 
-## Next Steps After Fix
-1. Restart Unreal Editor
-2. Test MCP server connection
-3. Verify opencode integration
+## Troubleshooting
+
+- If `GET /mcp` times out, confirm the plugin is enabled and the Editor was restarted.
+- If log resolution fails, call `unreal_logs/get_log_path` to see what paths were searched.
