@@ -57,7 +57,7 @@ This Unreal Engine plugin enables opencode (via MCP) to (1) read Unreal logs and
 - [x] Created plugin folder structure and initial files (`UnrealMCPLogForwarder.uplugin`, etc.).
 - [x] Updated mcp_log_forwarder.py to MCP server (HTTP server on port 3001).
 - [x] Implemented dynamic log path resolution + `unreal_logs/get_log_path`.
-- [ ] Implemented `unreal_logs/exec` Python execution tool.
+- [x] Implemented `unreal_logs/exec` Python execution tool.
 - [x] Created this plan file.
 - [x] Tested in Unreal Engine.
 - [x] Configured and tested with opencode.
@@ -72,7 +72,7 @@ This Unreal Engine plugin enables opencode (via MCP) to (1) read Unreal logs and
 ### Main Thread Execution
 Unreal editor APIs (like `unreal.EditorAssetLibrary` and `unreal.EditorLevelLibrary`) generally must be called from the main thread.
 
-Because the HTTP server handles requests on background threads, `unreal_logs/exec` schedules Python execution onto the main thread using a Slate tick callback and waits (with a timeout) for the result.
+Because the HTTP server handles requests on background threads, `unreal_logs/exec` schedules Python execution onto the main thread using an editor tick callback when available, otherwise a Slate tick callback, and waits (with a timeout) for the result.
 
 ## Decision Log / Failed Attempts
 ### Attempt: Capture logs via Unreal output device

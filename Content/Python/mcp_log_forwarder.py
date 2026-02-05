@@ -28,9 +28,10 @@ _MAIN_THREAD_QUEUE = []
 _MAIN_THREAD_LOCK = threading.Lock()
 _MAIN_THREAD_INIT = False
 _MAIN_THREAD_READY = False
+_MAIN_THREAD_IDENT = None
 
 _TICK_HANDLE = None
-_TICK_KIND = None  # "post" or "pre"
+_TICK_KIND = None  # "editor", "slate_post", or "slate_pre"
 
 _SERVER = None
 _SERVER_THREAD = None
@@ -56,9 +57,17 @@ def _log_error(msg):
         pass
 
 
+def _safe_get_ident():
+    try:
+        return threading.get_ident()
+    except Exception:
+        return None
+
+
 def _ensure_main_thread_runner():
     """Register a tick callback to run queued work on the editor main thread."""
     global _MAIN_THREAD_INIT, _MAIN_THREAD_READY
+    global _MAIN_THREAD_IDENT
     global _TICK_HANDLE, _TICK_KIND
 
     if _MAIN_THREAD_INIT:
@@ -69,18 +78,32 @@ def _ensure_main_thread_runner():
         _MAIN_THREAD_READY = False
         return
 
-    # Many Unreal Python builds expose register_slate_post_tick_callback.
-    register = getattr(unreal, "register_slate_post_tick_callback", None)
-    if register is None:
-        register = getattr(unreal, "register_slate_pre_tick_callback", None)
+    # Prefer editor tick over Slate tick. In some configurations Slate can be multi-threaded.
+    register = getattr(unreal, "register_editor_tick_callback", None)
+    if register is not None:
+        _TICK_KIND = "editor"
+    else:
+        register = getattr(unreal, "register_slate_post_tick_callback", None)
+        if register is not None:
+            _TICK_KIND = "slate_post"
+        else:
+            register = getattr(unreal, "register_slate_pre_tick_callback", None)
+            if register is not None:
+                _TICK_KIND = "slate_pre"
 
     if register is None:
-        _log_error("No Slate tick callback registration found; cannot run exec on main thread.")
+        _log_error("No editor/slate tick callback registration found; cannot run exec on main thread.")
         _MAIN_THREAD_INIT = True
         _MAIN_THREAD_READY = False
         return
 
     def _tick(_delta_time):
+        global _MAIN_THREAD_IDENT
+
+        # Capture the runner thread identity for diagnostics.
+        if _MAIN_THREAD_IDENT is None:
+            _MAIN_THREAD_IDENT = _safe_get_ident()
+
         # Drain queue
         while True:
             with _MAIN_THREAD_LOCK:
@@ -93,11 +116,13 @@ def _ensure_main_thread_runner():
                 _log_error(f"Main-thread task failed: {e}")
 
     try:
+        # If this is called from init_unreal.py during editor startup, we're on the main thread.
+        if _MAIN_THREAD_IDENT is None:
+            _MAIN_THREAD_IDENT = _safe_get_ident()
         _TICK_HANDLE = register(_tick)
-        _TICK_KIND = "post" if getattr(unreal, "register_slate_post_tick_callback", None) is register else "pre"
         _MAIN_THREAD_INIT = True
         _MAIN_THREAD_READY = True
-        _log_info("Main-thread runner registered via Slate tick callback")
+        _log_info(f"Main-thread runner registered via {_TICK_KIND} tick callback")
     except Exception as e:
         _log_error(f"Failed to register main-thread runner: {e}")
         _MAIN_THREAD_INIT = True
@@ -107,9 +132,32 @@ def _ensure_main_thread_runner():
 def _get_project_name():
     if unreal is not None:
         try:
-            name = unreal.SystemLibrary.get_project_name()
-            if name:
-                return str(name)
+            get_name = getattr(unreal.SystemLibrary, "get_project_name", None)
+            if get_name is not None:
+                name = get_name()
+                if name:
+                    return str(name)
+        except Exception:
+            pass
+
+        # Fallback: derive from project file path
+        try:
+            p = unreal.Paths.get_project_file_path()
+            if p:
+                base = os.path.basename(str(p))
+                root, _ext = os.path.splitext(base)
+                if root:
+                    return root
+        except Exception:
+            pass
+
+        # Fallback: derive from project directory
+        try:
+            d = unreal.Paths.project_dir()
+            if d:
+                base = os.path.basename(os.path.normpath(str(d)))
+                if base:
+                    return base
         except Exception:
             pass
     env_name = os.getenv("UNREAL_PROJECT_NAME")
@@ -374,15 +422,37 @@ def exec_python(code, mode="exec"):
     # Unreal editor APIs generally must run on the main thread.
     _ensure_main_thread_runner()
 
+    # If we are already on the runner thread, execute directly to avoid deadlocks/timeouts.
+    try:
+        current_ident = _safe_get_ident()
+        if _MAIN_THREAD_IDENT is not None and current_ident == _MAIN_THREAD_IDENT:
+            out = _run()
+            out["thread"] = {
+                "current_ident": current_ident,
+                "runner_ident": _MAIN_THREAD_IDENT,
+                "runner_kind": _TICK_KIND,
+                "scheduled": False,
+            }
+            return out
+    except Exception:
+        pass
+
     # If we cannot schedule, fail fast. Running Unreal editor APIs from this
     # request thread will often throw "outside the main game thread".
     if unreal is None or not _MAIN_THREAD_READY:
+        current_ident = _safe_get_ident()
         return {
             "ok": False,
             "mode": mode,
             "stdout": "",
             "stderr": "",
             "error": "Main-thread runner not available; cannot execute Unreal editor APIs from MCP request thread",
+            "thread": {
+                "current_ident": current_ident,
+                "runner_ident": _MAIN_THREAD_IDENT,
+                "runner_kind": _TICK_KIND,
+                "scheduled": False,
+            },
         }
 
     done = threading.Event()
@@ -391,19 +461,36 @@ def exec_python(code, mode="exec"):
     def _job():
         nonlocal out
         out = _run()
+        try:
+            current_ident = _safe_get_ident()
+            out["thread"] = {
+                "current_ident": current_ident,
+                "runner_ident": _MAIN_THREAD_IDENT,
+                "runner_kind": _TICK_KIND,
+                "scheduled": True,
+            }
+        except Exception:
+            pass
         done.set()
 
     with _MAIN_THREAD_LOCK:
         _MAIN_THREAD_QUEUE.append(_job)
 
     # Wait for result (avoid hanging the server thread forever)
-    if not done.wait(timeout=5.0):
+    if not done.wait(timeout=10.0):
+        current_ident = _safe_get_ident()
         return {
             "ok": False,
             "mode": mode,
             "stdout": "",
             "stderr": "",
             "error": "Timed out waiting for main-thread execution",
+            "thread": {
+                "current_ident": current_ident,
+                "runner_ident": _MAIN_THREAD_IDENT,
+                "runner_kind": _TICK_KIND,
+                "scheduled": True,
+            },
         }
 
     return out
@@ -461,7 +548,9 @@ def _unregister_tick():
         return
 
     try:
-        if kind == "post":
+        if kind == "editor":
+            unreg = getattr(unreal, "unregister_editor_tick_callback", None)
+        elif kind == "slate_post":
             unreg = getattr(unreal, "unregister_slate_post_tick_callback", None)
         else:
             unreg = getattr(unreal, "unregister_slate_pre_tick_callback", None)

@@ -64,7 +64,22 @@ In OpenCode prompts:
   - `use unreal_logs/get_log_path`
 - Execute Python inside Unreal:
   - `use unreal_logs/exec with code="print('hello from unreal')"`
-  - `use unreal_logs/exec with code="import unreal; unreal.EditorLevelLibrary.get_all_level_actors()"`
+  - `use unreal_logs/exec with code="import unreal; len(unreal.EditorLevelLibrary.get_all_level_actors())"`
+
+Example (project name derived from `.uproject` path):
+
+```python
+import os
+import unreal
+
+uproject = unreal.Paths.get_project_file_path()
+project_name = os.path.splitext(os.path.basename(str(uproject)))[0]
+print("project_name", project_name)
+
+# Example: project name + actor count
+actors = unreal.EditorLevelLibrary.get_all_level_actors()
+print({"project": project_name, "actor_count": len(actors)})
+```
 
 ## Log Path Resolution
 
