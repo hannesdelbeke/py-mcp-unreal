@@ -1,0 +1,20 @@
+# Unreal Engine Python files
+*.pyc
+__pycache__/
+
+# Unreal build artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp

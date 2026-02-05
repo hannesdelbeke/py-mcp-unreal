@@ -1,0 +1,16 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0",
+  "FriendlyName": "MCP Log Forwarder",
+  "Description": "Forwards Unreal logs to an MCP server using Python.",
+  "Category": "Python",
+  "EnabledByDefault": true,
+  "Modules": [],
+  "Plugins": [
+    {
+      "Name": "PythonScriptPlugin",
+      "Enabled": true
+    }
+  ]
+}
