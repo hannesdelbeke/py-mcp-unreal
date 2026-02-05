@@ -1,22 +1,23 @@
 # UnrealMCPLogForwarder
 
-So I know nothing about networking, or MCP servers, but managed to make a MCP server with AI.  
-It enabled your AI to talk with Unreal by:
-- reading Unreal's output log
-- send python commands to execute in Unreal
+I don't know much about networking or MCP servers, but I managed to build a small MCP-like server with AI.
+It lets an AI talk to Unreal by:
 
-There are no pre programmed commands like get actor, or blueprint or scene commands. it fully relies on your AI using python commands without any guard rails.  
-There might be limits., Since unreal doesn't expose everything to python.  
+- Reading Unreal's Output Log
+- Sending Python code to execute in Unreal
+
+There are no pre-programmed commands (e.g. "get actor" / blueprint helpers / scene commands). It fully relies on your AI writing Python, with no guardrails.
+There may be limits, since Unreal does not expose everything to Python.
 
 <img width="1394" height="429" alt="image" src="https://github.com/user-attachments/assets/c9f9d773-cb35-4937-a800-f16cf6b8f9f8" />
 I asked GPT to create a small maze with cubes, and it did so.
 
-For now I mostly plan to use this to ask AI, what went wrong check the log. to avoid need to copy paste log myself.
-everything below here is AI generated
+For now, I mostly plan to use this to ask an AI "what went wrong?" by checking the log, without having to copy/paste it manually.
+Everything below is AI-generated (with light edits).
 
 ---
 
-Expose a small MCP HTTP server inside the Unreal Editor so OpenCode can:
+Expose a small MCP-like HTTP server inside the Unreal Editor so OpenCode can:
 
 - Read the latest Unreal log lines (tail the log file)
 - Execute arbitrary Python in the running Unreal Editor (for inspection / automation)
@@ -35,6 +36,7 @@ Tools:
 - `unreal_logs/get_logs` - return last N lines of the Unreal log
 - `unreal_logs/get_log_path` - show which log file is being used + search paths
 - `unreal_logs/exec` - run Python code inside Unreal and return stdout / result
+  - Note: Unreal editor APIs generally require running on the editor/main thread. The plugin schedules execution accordingly.
 
 ## Install (Project Plugin)
 
@@ -42,13 +44,13 @@ Tools:
 
    `<ProjectRoot>/Plugins/UnrealMCPLogForwarder`
 
-2. In Unreal Editor:
+2. In the Unreal Editor:
 
    `Edit -> Plugins` and enable `MCP Log Forwarder`.
 
 3. Restart the Unreal Editor.
 
-You should see startup logs indicating the server started.
+You should see startup logs indicating that the server started.
 
 ## Configure OpenCode
 
