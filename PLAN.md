@@ -1,27 +1,33 @@
 # MCP Log Forwarder Plugin Plan and Progress
 
 ## Overview
-This Unreal Engine plugin enables opencode (via MCP) to read Unreal logs. The plugin is defined by `UnrealMCPLogForwarder.uplugin` and runs an MCP server that exposes a tool for pulling logs on demand, allowing opencode to query and retrieve buffered log entries.
+This Unreal Engine plugin enables opencode (via MCP) to (1) read Unreal logs and (2) execute Python inside the running Unreal Editor. The plugin is defined by `UnrealMCPLogForwarder.uplugin` and runs a small HTTP MCP server inside Unreal.
 
 ## Quick Start (Using the Plugin)
 
-1.  **Enable Plugin in Unreal**: Ensure the `UnrealMCPLogForwarder` plugin is enabled in your Unreal project and the Unreal Engine Editor is running. The plugin will start the MCP server on port `3001`.
-2.  **Configure opencode**: The following configuration has been added to `~/.config/opencode/opencode.json` (See Step 2 below).
-3.  **Use the Tool**: In opencode, you can now use the `unreal_logs/get_logs` tool:
-    - `use the unreal_logs/get_logs tool to check for recent errors.`
-    - `use the unreal_logs/get_logs tool with a limit of 10 to see the 10 most recent logs.`
+1.  **Enable Plugin in Unreal**: Ensure the `UnrealMCPLogForwarder` plugin is enabled and the Unreal Editor is running. The plugin starts the MCP server on port `3001`.
+2.  **Configure opencode**: Add the remote MCP config (Step 2 below).
+3.  **Use the Tools**:
+    - Read logs: `use the unreal_logs/get_logs tool with limit=200`
+    - Diagnose log path: `use the unreal_logs/get_log_path tool`
+    - Run Python in Unreal: `use the unreal_logs/exec tool with code="print('hello')"`
 
 ## Goal
-- Unreal Engine logs are read from the on-disk log file.
-- An MCP server runs locally on **port 3001**, providing a "get_logs" tool.
-- Opencode connects as MCP client and can call the tool to retrieve logs.
+- Provide an MCP server in Unreal that opencode can call.
+- Log access is pull-based (opencode requests last N lines) to avoid unbounded growth.
+- Python execution is tool-based (opencode sends Python code; Unreal executes and returns output).
 
 ## Plan Steps
 1. **Update mcp_log_forwarder.py**:
-   - Implemented an MCP HTTP server using Python's standard library modules, running on port 3001 in a separate thread.
-   - Exposed the "unreal_logs/get_logs" tool, which returns the last X log lines (default 500) from the Unreal log file.
-   - Resolves the current log file dynamically (project Saved/Logs preferred, then LocalAppData fallbacks) and tails efficiently.
-   - Supports override via env var `UNREAL_MCP_LOG_PATH` or tool arg `path`.
+   - Run an MCP HTTP server (in-process in Unreal) using Python stdlib on port 3001.
+   - Expose tools:
+     - `unreal_logs/get_logs` tails the last N lines from the resolved log file.
+     - `unreal_logs/get_log_path` reports which log file is being used + search paths.
+     - `unreal_logs/exec` executes arbitrary Python in the Unreal Python environment.
+   - Resolve log path dynamically:
+     - Preferred: `<Project>/Saved/Logs/*.log`.
+     - Fallbacks: `%LOCALAPPDATA%\UnrealEngine\*\Saved\Logs\*.log` and `%LOCALAPPDATA%\<ProjectName>\Saved\Logs\*.log`.
+     - Overrides: `UNREAL_MCP_LOG_PATH` (env) or `path` tool arg (per call).
 
 2. **Configure opencode**:
    - The user's opencode installation has been configured by creating a global config file at `~/.config/opencode/opencode.json` with the following remote MCP configuration:
@@ -49,8 +55,25 @@ This Unreal Engine plugin enables opencode (via MCP) to read Unreal logs. The pl
 
 ## Progress
 - [x] Created plugin folder structure and initial files (`UnrealMCPLogForwarder.uplugin`, etc.).
-- [x] Updated mcp_log_forwarder.py to MCP server (Implemented HTTP server on port 3001, exposed `unreal_logs/get_logs` tool with log line limit).
+- [x] Updated mcp_log_forwarder.py to MCP server (HTTP server on port 3001).
+- [x] Implemented dynamic log path resolution + `unreal_logs/get_log_path`.
+- [ ] Implemented `unreal_logs/exec` Python execution tool.
 - [x] Created this plan file.
-- [ ] Tested in Unreal Engine.
-- [ ] Configured and tested with opencode. (Pending creation of opencode.json).</content>
+- [x] Tested in Unreal Engine.
+- [x] Configured and tested with opencode.
+
+## Architecture
+- Unreal runs `Content/Python/init_unreal.py` at startup.
+- `init_unreal.py` imports `Content/Python/mcp_log_forwarder.py`.
+- `mcp_log_forwarder.py` starts an HTTP server on `127.0.0.1:${UNREAL_MCP_PORT:-3001}` and implements MCP-like endpoints:
+  - `GET /mcp` for tool discovery
+  - `POST /mcp/messages` for tool execution
+
+## Decision Log / Failed Attempts
+### Attempt: Capture logs via Unreal output device
+We attempted to capture logs directly inside Unreal using `unreal.OutputDevice` to register a custom output device.
+
+Result: Unreal 5.6 Python API does not expose `unreal.OutputDevice` (error: `module 'unreal' has no attribute 'OutputDevice'`).
+
+Conclusion: Do not try the output-device approach again for this plugin. Use on-disk log tailing instead.
 <parameter name="filePath">C:\Users\hannes\Documents\Unreal Projects\Test\Plugins\UnrealMCPLogForwarder\PLAN.md
