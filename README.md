@@ -1,6 +1,7 @@
 # UnrealMCPLogForwarder
 
-I don't know much about networking or MCP servers, but I managed to build a small MCP-like server with AI.
+I don't know much about networking or MCP servers, but I managed to build a small MCP-like server with GPT-5.2 (Github copilot free tier) in 3 hours🚀.
+
 It lets an AI talk to Unreal by:
 
 - Reading Unreal's Output Log
