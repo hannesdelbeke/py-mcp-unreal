@@ -24,6 +24,10 @@ LOG_LINE_LIMIT = 5000  # Safety cap on returned lines
 _CACHED_LOG_PATH = None
 _CACHED_SEARCH = None
 
+_MAIN_THREAD_QUEUE = []
+_MAIN_THREAD_LOCK = threading.Lock()
+_MAIN_THREAD_INIT = False
+
 
 def _log_info(msg):
     try:
@@ -43,6 +47,48 @@ def _log_error(msg):
             print("ERROR: " + str(msg))
     except Exception:
         pass
+
+
+def _ensure_main_thread_runner():
+    """Register a tick callback to run queued work on the editor main thread."""
+    global _MAIN_THREAD_INIT
+
+    if _MAIN_THREAD_INIT:
+        return
+
+    if unreal is None:
+        _MAIN_THREAD_INIT = True
+        return
+
+    # Many Unreal Python builds expose register_slate_post_tick_callback.
+    register = getattr(unreal, "register_slate_post_tick_callback", None)
+    if register is None:
+        register = getattr(unreal, "register_slate_pre_tick_callback", None)
+
+    if register is None:
+        _log_error("No Slate tick callback registration found; cannot run exec on main thread.")
+        _MAIN_THREAD_INIT = True
+        return
+
+    def _tick(_delta_time):
+        # Drain queue
+        while True:
+            with _MAIN_THREAD_LOCK:
+                if not _MAIN_THREAD_QUEUE:
+                    break
+                fn = _MAIN_THREAD_QUEUE.pop(0)
+            try:
+                fn()
+            except Exception as e:
+                _log_error(f"Main-thread task failed: {e}")
+
+    try:
+        register(_tick)
+        _MAIN_THREAD_INIT = True
+        _log_info("Main-thread runner registered via Slate tick callback")
+    except Exception as e:
+        _log_error(f"Failed to register main-thread runner: {e}")
+        _MAIN_THREAD_INIT = True
 
 
 def _get_project_name():
@@ -313,20 +359,34 @@ def exec_python(code, mode="exec"):
             }
 
     # Unreal editor APIs generally must run on the main thread.
-    # Use a safe main-thread execution helper when available.
-    try:
-        if hasattr(unreal, "PythonBPLib") and hasattr(unreal.PythonBPLib, "execute_python_command"):
-            # Best-effort fallback; no stdout capture.
-            ok = unreal.PythonBPLib.execute_python_command(code_str)
-            return {"ok": bool(ok), "mode": mode, "stdout": "", "stderr": "", "result": None}
-    except Exception:
-        pass
+    _ensure_main_thread_runner()
 
-    try:
-        return unreal.run_on_main_thread(_run)
-    except Exception:
-        # If run_on_main_thread isn't available, run directly (may fail for editor APIs).
+    # If we cannot schedule, run directly (may fail for editor APIs).
+    if unreal is None or not _MAIN_THREAD_INIT:
         return _run()
+
+    done = threading.Event()
+    out = {}
+
+    def _job():
+        nonlocal out
+        out = _run()
+        done.set()
+
+    with _MAIN_THREAD_LOCK:
+        _MAIN_THREAD_QUEUE.append(_job)
+
+    # Wait for result (avoid hanging the server thread forever)
+    if not done.wait(timeout=5.0):
+        return {
+            "ok": False,
+            "mode": mode,
+            "stdout": "",
+            "stderr": "",
+            "error": "Timed out waiting for main-thread execution",
+        }
+
+    return out
 
 # The MCP Tool Definition (for discovery)
 MCP_TOOLS = {
