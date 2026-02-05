@@ -20,7 +20,8 @@ This Unreal Engine plugin enables opencode (via MCP) to read Unreal logs. The pl
 1. **Update mcp_log_forwarder.py**:
    - Implemented an MCP HTTP server using Python's standard library modules, running on port 3001 in a separate thread.
    - Exposed the "unreal_logs/get_logs" tool, which returns the last X log lines (default 500) from the Unreal log file.
-   - Reads from `C:\\Users\\hannes\\AppData\\Local\\UnrealEngine\\5.6\\Saved\\Logs\\Test.log` and tails efficiently.
+   - Resolves the current log file dynamically (project Saved/Logs preferred, then LocalAppData fallbacks) and tails efficiently.
+   - Supports override via env var `UNREAL_MCP_LOG_PATH` or tool arg `path`.
 
 2. **Configure opencode**:
    - The user's opencode installation has been configured by creating a global config file at `~/.config/opencode/opencode.json` with the following remote MCP configuration:

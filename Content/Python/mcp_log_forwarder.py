@@ -1,15 +1,164 @@
-import unreal
-import threading
+import os
 import json
+import threading
 import http.server
 import socketserver
-import os
+import glob
+
+try:
+    import unreal
+except Exception:
+    unreal = None
 
 # --- Configuration ---
-MCP_PORT = 3001
-LOG_FILE_PATH = "C:\\Users\\hannes\\AppData\\Local\\UnrealEngine\\5.6\\Saved\\Logs\\Test.log"
+MCP_PORT = int(os.getenv("UNREAL_MCP_PORT", "3001"))
+
+# Optional overrides
+# - UNREAL_MCP_LOG_PATH: absolute path to a specific log file
+# - UNREAL_PROJECT_NAME: used if Unreal API is not available
+LOG_PATH_OVERRIDE = os.getenv("UNREAL_MCP_LOG_PATH")
+
 RETURN_LOG_LINES = 500  # Default lines to return per tool call
 LOG_LINE_LIMIT = 5000  # Safety cap on returned lines
+
+_CACHED_LOG_PATH = None
+_CACHED_SEARCH = None
+
+
+def _log_info(msg):
+    try:
+        if unreal is not None:
+            unreal.log(str(msg))
+        else:
+            print(str(msg))
+    except Exception:
+        pass
+
+
+def _log_error(msg):
+    try:
+        if unreal is not None:
+            unreal.log_error(str(msg))
+        else:
+            print("ERROR: " + str(msg))
+    except Exception:
+        pass
+
+
+def _get_project_name():
+    if unreal is not None:
+        try:
+            name = unreal.SystemLibrary.get_project_name()
+            if name:
+                return str(name)
+        except Exception:
+            pass
+    env_name = os.getenv("UNREAL_PROJECT_NAME")
+    return env_name if env_name else None
+
+
+def _pick_newest_log(log_files, project_name=None):
+    if not log_files:
+        return None
+
+    preferred = []
+    if project_name:
+        pn = project_name.lower()
+        for p in log_files:
+            base = os.path.basename(p).lower()
+            if base.startswith(pn) and base.endswith(".log"):
+                preferred.append(p)
+
+    candidates = preferred if preferred else log_files
+    candidates = [p for p in candidates if os.path.isfile(p)]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+
+def _resolve_log_file_path(explicit_path=None, use_cache=True):
+    global _CACHED_LOG_PATH, _CACHED_SEARCH
+
+    if use_cache and explicit_path is None and _CACHED_LOG_PATH:
+        return _CACHED_LOG_PATH, (_CACHED_SEARCH or [])
+
+    searched = []
+
+    def _try_path(p):
+        if not p:
+            return None
+        p = os.path.expandvars(os.path.expanduser(str(p)))
+        p = os.path.normpath(p)
+        searched.append(p)
+        if os.path.isfile(p):
+            return p
+        return None
+
+    # 1) Explicit tool argument path
+    if explicit_path:
+        resolved = _try_path(explicit_path)
+        if resolved:
+            return resolved, searched
+
+    # 2) Env override
+    if LOG_PATH_OVERRIDE:
+        resolved = _try_path(LOG_PATH_OVERRIDE)
+        if resolved:
+            _CACHED_LOG_PATH, _CACHED_SEARCH = resolved, searched
+            return resolved, searched
+
+    project_name = _get_project_name()
+
+    # 3) Project Saved/Logs (Editor/project)
+    if unreal is not None:
+        try:
+            saved_dir = unreal.Paths.project_saved_dir()
+            if saved_dir:
+                logs_dir = os.path.join(str(saved_dir), "Logs")
+                searched.append(os.path.normpath(logs_dir))
+                if os.path.isdir(logs_dir):
+                    logs = glob.glob(os.path.join(logs_dir, "*.log"))
+                    picked = _pick_newest_log(logs, project_name=project_name)
+                    if picked:
+                        _CACHED_LOG_PATH, _CACHED_SEARCH = picked, searched
+                        return picked, searched
+        except Exception:
+            pass
+
+    # 4) Windows LocalAppData locations
+    localappdata = os.getenv("LOCALAPPDATA")
+    if localappdata:
+        # 4a) Engine logs: %LOCALAPPDATA%\UnrealEngine\*\Saved\Logs\
+        ue_root = os.path.join(localappdata, "UnrealEngine")
+        searched.append(os.path.normpath(ue_root))
+        if os.path.isdir(ue_root):
+            version_dirs = [os.path.join(ue_root, d) for d in os.listdir(ue_root)]
+            logs = []
+            for vd in version_dirs:
+                logs_dir = os.path.join(vd, "Saved", "Logs")
+                searched.append(os.path.normpath(logs_dir))
+                if os.path.isdir(logs_dir):
+                    logs.extend(glob.glob(os.path.join(logs_dir, "*.log")))
+            picked = _pick_newest_log(logs, project_name=project_name)
+            if picked:
+                _CACHED_LOG_PATH, _CACHED_SEARCH = picked, searched
+                return picked, searched
+
+        # 4b) Packaged-ish logs: %LOCALAPPDATA%\<Project>\Saved\Logs\
+        if project_name:
+            logs_dir = os.path.join(localappdata, project_name, "Saved", "Logs")
+            searched.append(os.path.normpath(logs_dir))
+            if os.path.isdir(logs_dir):
+                logs = glob.glob(os.path.join(logs_dir, "*.log"))
+                picked = _pick_newest_log(logs, project_name=project_name)
+                if picked:
+                    _CACHED_LOG_PATH, _CACHED_SEARCH = picked, searched
+                    return picked, searched
+
+    _CACHED_LOG_PATH, _CACHED_SEARCH = None, searched
+    return None, searched
 
 # --- Log Tailing Utility ---
 
@@ -21,7 +170,7 @@ def tail_log_file(filename, n=RETURN_LOG_LINES):
     try:
         # Check if the file exists before attempting to open
         if not os.path.exists(filename):
-            unreal.log_error(f"Log file not found at: {filename}")
+            _log_error(f"Log file not found at: {filename}")
             return [f"ERROR: Log file not found at {filename}"]
 
         with open(filename, "rb") as f:
@@ -63,14 +212,14 @@ def tail_log_file(filename, n=RETURN_LOG_LINES):
             return out
 
     except Exception as e:
-        unreal.log_error(f"Error reading log file: {e}")
+        _log_error(f"Error reading log file: {e}")
         return [f"ERROR: Could not read log file: {e}"]
 
 
 # --- MCP Tool Implementation ---
 
-def get_logs(limit=RETURN_LOG_LINES):
-    """Retrieves the most recent Unreal Engine log entries from the file."""
+def get_logs(limit=RETURN_LOG_LINES, path=None):
+    """Retrieves the most recent Unreal Engine log entries from the resolved log file."""
     # Ensure limit is an integer and within the safe bounds
     try:
         limit = int(limit)
@@ -79,12 +228,33 @@ def get_logs(limit=RETURN_LOG_LINES):
         
     limit = max(1, min(limit, LOG_LINE_LIMIT))
     
-    return tail_log_file(LOG_FILE_PATH, limit)
+    resolved, searched = _resolve_log_file_path(explicit_path=path)
+    if not resolved:
+        return [
+            "ERROR: Could not resolve Unreal log file.",
+            "Searched:",
+        ] + searched[-20:]
+
+    return tail_log_file(resolved, limit)
+
+
+def get_log_path(path=None):
+    """Return the current resolved log path and search locations."""
+    resolved, searched = _resolve_log_file_path(explicit_path=path, use_cache=(path is None))
+    return {
+        "project": _get_project_name(),
+        "resolved": resolved,
+        "searched": searched,
+        "hint": {
+            "override_env": "UNREAL_MCP_LOG_PATH",
+            "port_env": "UNREAL_MCP_PORT",
+        },
+    }
 
 # The MCP Tool Definition (for discovery)
 MCP_TOOLS = {
     "unreal_logs/get_logs": {
-        "description": f"Retrieves the most recent Unreal Engine log entries from {LOG_FILE_PATH}. Default limit is 500 lines.",
+        "description": "Retrieves the most recent Unreal Engine log entries from the resolved log file. Default limit is 500 lines.",
         "function": get_logs,
         "parameters": {
             "type": "object",
@@ -92,6 +262,23 @@ MCP_TOOLS = {
                 "limit": {
                     "type": "integer",
                     "description": f"The maximum number of log lines to return (default {RETURN_LOG_LINES}, max {LOG_LINE_LIMIT})."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional absolute path to a specific .log file (overrides auto-detection for this call)."
+                }
+            }
+        }
+    },
+    "unreal_logs/get_log_path": {
+        "description": "Returns the resolved Unreal log file path plus search locations. Supports optional path override.",
+        "function": get_log_path,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Optional absolute path to test as the log file path."
                 }
             }
         }
@@ -115,12 +302,18 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-type", "application/json")
             self.end_headers()
             
+            resolved, _ = _resolve_log_file_path(use_cache=True)
+
             tool_definitions = []
             for name, tool_data in MCP_TOOLS.items():
+                desc = tool_data["description"]
+                if name == "unreal_logs/get_logs" and resolved:
+                    desc = desc + f" (current: {resolved})"
+
                 tool_definitions.append({
                     "name": name,
-                    "description": tool_data["description"],
-                    "parameters": tool_data["parameters"]
+                    "description": desc,
+                    "parameters": tool_data["parameters"],
                 })
                 
             response = {"tools": tool_definitions}
@@ -160,7 +353,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                     self._send_400(f"Tool not found or invalid: {tool_name}")
             
             except Exception as e:
-                unreal.log_error(f"MCP Server error during POST: {e}")
+                _log_error(f"MCP Server error during POST: {e}")
                 self._send_500(str(e))
         else:
             self._send_404()
@@ -195,13 +388,13 @@ def start_mcp_server():
 
         # We bind to 0.0.0.0 to listen on all interfaces
         server = ThreadingHTTPServer(("127.0.0.1", MCP_PORT), MCPHandler)
-        unreal.log(f"Starting MCP Server (File Reader) on port {MCP_PORT}...")
+        _log_info(f"Starting MCP Server (File Reader) on port {MCP_PORT}...")
         server.serve_forever()
     except Exception as e:
-        unreal.log_error(f"Failed to start MCP Server (Port {MCP_PORT} in use?): {e}")
+        _log_error(f"Failed to start MCP Server (Port {MCP_PORT} in use?): {e}")
 
 # Start the server in a separate daemon thread
-_server_thread = threading.Thread(target=start_mcp_server, daemon=True)
-_server_thread.start()
-
-unreal.log(f"MCP Log Forwarder (Server Thread) started on port {MCP_PORT}. Access via http://localhost:{MCP_PORT}")
+if os.getenv("UNREAL_MCP_DISABLE_SERVER") != "1":
+    _server_thread = threading.Thread(target=start_mcp_server, daemon=True)
+    _server_thread.start()
+    _log_info(f"MCP Log Forwarder (Server Thread) started on port {MCP_PORT}. Access via http://localhost:{MCP_PORT}")

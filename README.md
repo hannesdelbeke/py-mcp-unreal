@@ -7,8 +7,16 @@
 - 🔧 Auto-startup fix applied - CanContainContent added
 
 ## Log Source
-This plugin reads logs from the Unreal on-disk log file (tailing the last N lines):
-`C:\\Users\\hannes\\AppData\\Local\\UnrealEngine\\5.6\\Saved\\Logs\\Test.log`
+This plugin resolves the current Unreal log file dynamically (tailing the last N lines):
+
+- Preferred: `<Project>/Saved/Logs/*.log`
+- Fallbacks on Windows:
+  - `%LOCALAPPDATA%\\UnrealEngine\\*\\Saved\\Logs\\*.log`
+  - `%LOCALAPPDATA%\\<ProjectName>\\Saved\\Logs\\*.log`
+
+Overrides:
+- Env var: `UNREAL_MCP_LOG_PATH` (absolute path to a specific log file)
+- Tool arg: `path` (per-call override)
 
 ## Solution Applied
 Added `CanContainContent: true` to plugin configuration - this is the critical requirement for Unreal Engine to auto-execute Python scripts in plugin's Content/Python folder.
