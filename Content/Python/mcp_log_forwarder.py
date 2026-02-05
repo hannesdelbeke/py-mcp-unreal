@@ -374,9 +374,16 @@ def exec_python(code, mode="exec"):
     # Unreal editor APIs generally must run on the main thread.
     _ensure_main_thread_runner()
 
-    # If we cannot schedule, run directly (may fail for editor APIs).
+    # If we cannot schedule, fail fast. Running Unreal editor APIs from this
+    # request thread will often throw "outside the main game thread".
     if unreal is None or not _MAIN_THREAD_READY:
-        return _run()
+        return {
+            "ok": False,
+            "mode": mode,
+            "stdout": "",
+            "stderr": "",
+            "error": "Main-thread runner not available; cannot execute Unreal editor APIs from MCP request thread",
+        }
 
     done = threading.Event()
     out = {}
@@ -635,3 +642,10 @@ if os.getenv("UNREAL_MCP_DISABLE_SERVER") != "1":
     _SERVER_THREAD = threading.Thread(target=start_mcp_server, daemon=True)
     _SERVER_THREAD.start()
     _log_info(f"MCP Log Forwarder (Server Thread) started on port {MCP_PORT}. Access via http://localhost:{MCP_PORT}")
+
+# Ensure main-thread runner is registered as early as possible.
+# init_unreal.py runs on editor startup (main thread), so this should succeed.
+try:
+    _ensure_main_thread_runner()
+except Exception:
+    pass
