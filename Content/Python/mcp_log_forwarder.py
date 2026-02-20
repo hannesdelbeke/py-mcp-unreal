@@ -223,7 +223,8 @@ def _resolve_log_file_path(explicit_path=None, use_cache=True):
         try:
             saved_dir = unreal.Paths.project_saved_dir()
             if saved_dir:
-                logs_dir = os.path.join(str(saved_dir), "Logs")
+                saved_dir_abs = unreal.Paths.convert_relative_path_to_full(saved_dir)
+                logs_dir = os.path.join(str(saved_dir_abs), "Logs")
                 searched.append(os.path.normpath(logs_dir))
                 if os.path.isdir(logs_dir):
                     logs = glob.glob(os.path.join(logs_dir, "*.log"))
@@ -231,8 +232,8 @@ def _resolve_log_file_path(explicit_path=None, use_cache=True):
                     if picked:
                         _CACHED_LOG_PATH, _CACHED_SEARCH = picked, searched
                         return picked, searched
-        except Exception:
-            pass
+        except Exception as e:
+            print(e)  # todo logging warn
 
     # 4) Windows LocalAppData locations
     localappdata = os.getenv("LOCALAPPDATA")
