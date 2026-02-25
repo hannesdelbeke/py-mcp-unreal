@@ -25,7 +25,10 @@ That imports `mcp_log_forwarder.py`, which starts a server on:
   - Server and main-thread runner status
   - Includes current log resolution and startup guidance
 - `GET /tasks/{task_id}/status`
-  - Poll async execution task state/result
+  - Poll async execution task state/result (fallback when SSE is unavailable)
+- `GET /tasks/{task_id}/stream`
+  - Server-Sent Events (SSE) stream for live task events
+  - Streams task status, progress, stdout/stderr, and tailed log lines
 - `POST /mcp/messages`
   - Execute a tool with payload: `{"tool": "...", "arguments": {...}}`
 
@@ -41,7 +44,8 @@ That imports `mcp_log_forwarder.py`, which starts a server on:
   - Exposes `report_progress(message, current=None, total=None)` in execution context
 - `unreal_logs/exec_async`
   - Queue Python execution and return immediately with `task_id`
-  - Poll `GET /tasks/{task_id}/status` for completion
+  - Stream live events via `GET /tasks/{task_id}/stream`
+  - Poll `GET /tasks/{task_id}/status` as fallback
 
 ## OpenCode Config
 
@@ -98,6 +102,26 @@ Then poll:
 
 `GET /tasks/<task_id>/status`
 
+Or stream live events:
+
+```bash
+curl -N http://127.0.0.1:3001/tasks/<task_id>/stream
+```
+
+SSE event types currently emitted:
+- `task_status`
+- `progress`
+- `stdout`
+- `stderr`
+- `log_line`
+- `log_info`
+- `log_error`
+- `task_result`
+
+Resume from a known event cursor:
+- Query param: `GET /tasks/<task_id>/stream?cursor=<seq>`
+- Or header: `Last-Event-ID: <seq>`
+
 ## Structured Errors
 
 HTTP/API errors are returned as JSON:
@@ -129,6 +153,12 @@ Execution failures from `unreal_logs/exec` / `exec_async` include:
   - Maximum allowed timeout seconds (default `300`)
 - `UNREAL_MCP_ERROR_LOG_LINES`
   - Number of log lines attached to exec error payloads (default `120`)
+- `UNREAL_MCP_TASK_EVENT_BUFFER`
+  - Max buffered SSE events per task before oldest events are dropped (default `2000`)
+- `UNREAL_MCP_SSE_HEARTBEAT_SECONDS`
+  - Idle heartbeat interval for SSE connections (default `15`)
+- `UNREAL_MCP_LOG_TAIL_POLL_SECONDS`
+  - Poll interval for disk log tail streaming during async tasks (default `0.25`)
 - `UNREAL_MCP_DISABLE_SERVER`
   - Set to `1` to disable server startup
 
@@ -145,7 +175,8 @@ Resolution order:
 
 - Async is non-blocking for the MCP client (you get a `task_id` immediately).
 - Unreal Python still executes on Unreal's main thread for editor safety.
-- Use `exec_async` + polling to avoid HTTP wait timeouts for long jobs.
+- Use `exec_async` + `/stream` for real-time visibility on long jobs.
+- Keep `/status` polling as a compatibility fallback.
 
 ## Troubleshooting
 
