@@ -742,16 +742,17 @@ def _execute_code_now(code_str, mode, timeout, task_id=None):
                 },
             )
 
-    g = {"unreal": unreal, "report_progress": report_progress}
-    l = {}
+    # Use one shared namespace for globals/locals to avoid Python exec comprehension
+    # scope surprises (e.g. NameError inside list comprehensions).
+    ns = {"unreal": unreal, "report_progress": report_progress}
 
     try:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             if mode == "eval":
-                result = eval(code_str, g, l)
+                result = eval(code_str, ns, ns)
             else:
-                exec(code_str, g, l)
-                result = l.get("result", None)
+                exec(code_str, ns, ns)
+                result = ns.get("result", None)
 
         return {
             "ok": True,
@@ -1010,7 +1011,7 @@ MCP_TOOLS = {
         }
     },
     "unreal_logs/exec_async": {
-        "description": "Queue Python execution in Unreal Editor and return immediately with a task_id. Poll /tasks/{task_id}/status for completion.",
+        "description": "Queue Python execution in Unreal Editor and return immediately with a task_id. Stream live events via /tasks/{task_id}/stream and use /status as fallback.",
         "function": exec_python_async,
         "parameters": {
             "type": "object",
@@ -1059,6 +1060,11 @@ def get_mcp_help():
         "status": "ok",
         "timestamp": _utc_now_iso(),
         "startup_guidance": _build_startup_guidance(),
+        "limitations": [
+            "Unreal editor API calls must run on Unreal's main thread.",
+            "exec_async is non-blocking for clients, but task execution is still main-thread serialized inside Unreal.",
+            "Live log streaming is file-tail based; availability depends on resolved log path and file writes.",
+        ],
         "server": {
             "name": "UnrealMCPLogForwarder",
             "host": "127.0.0.1",

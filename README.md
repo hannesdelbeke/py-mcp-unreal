@@ -178,6 +178,12 @@ Resolution order:
 - Use `exec_async` + `/stream` for real-time visibility on long jobs.
 - Keep `/status` polling as a compatibility fallback.
 
+## Limitations
+
+- Unreal editor API calls must run on Unreal's main thread.
+- `exec_async` improves client responsiveness, but Unreal execution remains serialized on the main thread.
+- Live log streaming is based on tailing the resolved log file on disk (not Unreal in-memory log hooks).
+
 ## Troubleshooting
 
 - If `/mcp` is down:
