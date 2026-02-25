@@ -5,6 +5,8 @@ import http.server
 import socketserver
 import glob
 import time
+import datetime
+import traceback
 
 try:
     import unreal
@@ -23,6 +25,7 @@ RETURN_LOG_LINES = 500  # Default lines to return per tool call
 LOG_LINE_LIMIT = 5000  # Safety cap on returned lines
 DEFAULT_EXEC_TIMEOUT = int(os.getenv("UNREAL_MCP_EXEC_TIMEOUT", "60"))
 MAX_EXEC_TIMEOUT = int(os.getenv("UNREAL_MCP_MAX_EXEC_TIMEOUT", "300"))
+RECENT_ERROR_LOG_LINES = int(os.getenv("UNREAL_MCP_ERROR_LOG_LINES", "120"))
 
 _CACHED_LOG_PATH = None
 _CACHED_SEARCH = None
@@ -40,12 +43,29 @@ _SERVER = None
 _SERVER_THREAD = None
 
 
+def _utc_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
 def _clamp_exec_timeout(timeout):
     try:
         timeout = int(timeout)
     except (TypeError, ValueError):
         timeout = DEFAULT_EXEC_TIMEOUT
     return max(1, min(timeout, MAX_EXEC_TIMEOUT))
+
+
+def _structured_error(error_type, message, status_code=500, details=None):
+    out = {
+        "status": "error",
+        "error_type": str(error_type),
+        "message": str(message),
+        "timestamp": _utc_now_iso(),
+    }
+    if details is not None:
+        out["details"] = details
+    out["_status_code"] = int(status_code)
+    return out
 
 
 def _log_info(msg):
@@ -335,6 +355,19 @@ def tail_log_file(filename, n=RETURN_LOG_LINES):
         return [f"ERROR: Could not read log file: {e}"]
 
 
+def get_recent_logs(limit=RECENT_ERROR_LOG_LINES, path=None):
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = RECENT_ERROR_LOG_LINES
+    limit = max(1, min(limit, LOG_LINE_LIMIT))
+
+    resolved, _searched = _resolve_log_file_path(explicit_path=path, use_cache=True)
+    if not resolved:
+        return []
+    return tail_log_file(resolved, limit)
+
+
 # --- MCP Tool Implementation ---
 
 def get_logs(limit=RETURN_LOG_LINES, path=None):
@@ -382,16 +415,18 @@ def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
     timeout = _clamp_exec_timeout(timeout)
 
     if unreal is None:
-        return {
-            "ok": False,
-            "error": "unreal module not available",
-        }
+        return _structured_error(
+            error_type="UnrealUnavailable",
+            message="unreal module not available",
+            status_code=503,
+        )
 
     if code is None:
-        return {
-            "ok": False,
-            "error": "Missing required argument: code",
-        }
+        return _structured_error(
+            error_type="ValidationError",
+            message="Missing required argument: code",
+            status_code=400,
+        )
 
     try:
         code_str = str(code)
@@ -430,24 +465,29 @@ def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
 
             return {
                 "ok": True,
+                "status": "success",
                 "mode": mode,
                 "stdout": stdout.getvalue(),
                 "stderr": stderr.getvalue(),
                 "result": result,
                 "progress_events": progress_events,
                 "timeout_seconds": timeout,
+                "timestamp": _utc_now_iso(),
             }
         except Exception as e:
-            import traceback
             return {
                 "ok": False,
+                "status": "error",
+                "error_type": type(e).__name__,
+                "message": str(e),
                 "mode": mode,
                 "stdout": stdout.getvalue(),
                 "stderr": stderr.getvalue(),
-                "error": str(e),
-                "traceback": traceback.format_exc(),
+                "stack_trace": traceback.format_exc(),
                 "progress_events": progress_events,
+                "unreal_logs": get_recent_logs(),
                 "timeout_seconds": timeout,
+                "timestamp": _utc_now_iso(),
             }
 
     # Unreal editor APIs generally must run on the main thread.
@@ -474,10 +514,13 @@ def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
         current_ident = _safe_get_ident()
         return {
             "ok": False,
+            "status": "error",
+            "error_type": "MainThreadUnavailable",
+            "message": "Main-thread runner not available; cannot execute Unreal editor APIs from MCP request thread",
             "mode": mode,
             "stdout": "",
             "stderr": "",
-            "error": "Main-thread runner not available; cannot execute Unreal editor APIs from MCP request thread",
+            "timestamp": _utc_now_iso(),
             "thread": {
                 "current_ident": current_ident,
                 "runner_ident": _MAIN_THREAD_IDENT,
@@ -512,11 +555,14 @@ def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
         current_ident = _safe_get_ident()
         return {
             "ok": False,
+            "status": "error",
+            "error_type": "MainThreadTimeout",
+            "message": "Timed out waiting for main-thread execution",
             "mode": mode,
             "stdout": "",
             "stderr": "",
-            "error": "Timed out waiting for main-thread execution",
             "timeout_seconds": timeout,
+            "timestamp": _utc_now_iso(),
             "thread": {
                 "current_ident": current_ident,
                 "runner_ident": _MAIN_THREAD_IDENT,
@@ -682,18 +728,25 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             response = {"tools": tool_definitions}
             self.wfile.write(json.dumps(response).encode('utf-8'))
         else:
-            self._send_404()
+            self._send_error_json(404, "NotFound", f"Path not found: {self.path}")
 
     def do_POST(self):
         """Handle tool call request (POST /mcp/messages)."""
         if self.path == '/mcp/messages':
             try:
-                content_length = int(self.headers['Content-Length'])
+                content_length = int(self.headers.get('Content-Length', 0))
+                if content_length <= 0:
+                    self._send_error_json(400, "ValidationError", "Missing request body")
+                    return
+
                 post_data = self.rfile.read(content_length)
                 payload = json.loads(post_data.decode('utf-8'))
                 
                 tool_name = payload.get("tool")
                 arguments = payload.get("arguments", {})
+                if not isinstance(arguments, dict):
+                    self._send_error_json(400, "ValidationError", "Field 'arguments' must be an object")
+                    return
                 
                 tool_data = MCP_TOOLS.get(tool_name)
                 if tool_data and tool_data["function"]:
@@ -707,35 +760,42 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                     except (TypeError, AttributeError):
                         # Fallback for older Python versions or inspect issues
                         result = tool_data["function"](**arguments)
-                    
-                    self.send_response(200)
-                    self.send_header("Content-type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"result": result}).encode('utf-8'))
+
+                    status_code = 200
+                    if isinstance(result, dict):
+                        status_code = int(result.pop("_status_code", 200))
+
+                    self._send_json(status_code, {"result": result})
                 else:
-                    self._send_400(f"Tool not found or invalid: {tool_name}")
-            
+                    self._send_error_json(400, "ToolNotFound", f"Tool not found or invalid: {tool_name}")
+
+            except json.JSONDecodeError as e:
+                self._send_error_json(400, "InvalidJson", f"Invalid JSON payload: {e}")
             except Exception as e:
                 _log_error(f"MCP Server error during POST: {e}")
-                self._send_500(str(e))
+                self._send_error_json(500, "ServerError", str(e), details={"stack_trace": traceback.format_exc()})
         else:
-            self._send_404()
+            self._send_error_json(404, "NotFound", f"Path not found: {self.path}")
+
+    def _send_json(self, status_code, payload):
+        self.send_response(int(status_code))
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode('utf-8'))
+
+    def _send_error_json(self, status_code, error_type, message, details=None):
+        payload = _structured_error(error_type, message, status_code=status_code, details=details)
+        payload.pop("_status_code", None)
+        self._send_json(status_code, payload)
 
     def _send_400(self, message):
-        self.send_response(400)
-        self.send_header("Content-type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"error": message}).encode('utf-8'))
+        self._send_error_json(400, "BadRequest", message)
         
     def _send_404(self):
-        self.send_response(404)
-        self.end_headers()
+        self._send_error_json(404, "NotFound", "Path not found")
 
     def _send_500(self, message):
-        self.send_response(500)
-        self.send_header("Content-type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"error": message}).encode('utf-8'))
+        self._send_error_json(500, "ServerError", message)
 
 
 # Helper to run server in its own thread
