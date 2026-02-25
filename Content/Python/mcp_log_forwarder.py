@@ -71,6 +71,47 @@ def _structured_error(error_type, message, status_code=500, details=None):
     return out
 
 
+def _get_project_file_path():
+    if unreal is None:
+        return None
+    try:
+        p = unreal.Paths.get_project_file_path()
+        if p:
+            return str(p)
+    except Exception:
+        pass
+    return None
+
+
+def _build_startup_guidance():
+    server_url = f"http://127.0.0.1:{MCP_PORT}"
+    return {
+        "capability_keywords": [
+            "unreal",
+            "unreal engine",
+            "ue5",
+            "ue",
+            "editor scripting",
+        ],
+        "assistant_suggestion": (
+            "If user intent involves Unreal Editor tasks, suggest using this MCP server and call GET /mcp for tool discovery."
+        ),
+        "recommended_system_prompt_snippet": (
+            f"Available MCP Server: unreal_logs ({server_url}). "
+            "Tools: unreal_logs/get_logs, unreal_logs/get_log_path, unreal_logs/exec, unreal_logs/exec_async."
+        ),
+        "opencode_config_example": {
+            "mcp": {
+                "unreal_logs": {
+                    "type": "remote",
+                    "url": server_url,
+                    "enabled": True,
+                }
+            }
+        },
+    }
+
+
 def _log_info(msg):
     try:
         if unreal is not None:
@@ -834,6 +875,7 @@ def get_mcp_help():
     return {
         "status": "ok",
         "timestamp": _utc_now_iso(),
+        "startup_guidance": _build_startup_guidance(),
         "server": {
             "name": "UnrealMCPLogForwarder",
             "host": "127.0.0.1",
@@ -884,6 +926,7 @@ def get_health():
     return {
         "status": "ok",
         "timestamp": _utc_now_iso(),
+        "startup_guidance": _build_startup_guidance(),
         "server": {
             "listening": _SERVER is not None,
             "thread_alive": bool(_SERVER_THREAD is not None and _SERVER_THREAD.is_alive()),
@@ -898,6 +941,7 @@ def get_health():
         },
         "log_resolution": {
             "project": _get_project_name(),
+            "project_file": _get_project_file_path(),
             "resolved_log": resolved_log,
         },
     }
@@ -915,7 +959,15 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         """Handle tool discovery and diagnostics endpoints."""
         if self.path == '/mcp':
-            self._send_json(200, {"tools": _tool_definitions_with_runtime_context()})
+            self._send_json(
+                200,
+                {
+                    "tools": _tool_definitions_with_runtime_context(),
+                    "meta": {
+                        "startup_guidance": _build_startup_guidance(),
+                    },
+                },
+            )
         elif self.path == '/mcp/help':
             self._send_json(200, get_mcp_help())
         elif self.path == '/health':
