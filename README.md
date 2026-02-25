@@ -1,5 +1,5 @@
-# UnrealMCPLogForwarder
-A pure Python Unreal plugin containing a MCP-like server that lets an AI/LLM talk to Unreal by:  
+# UnrealPyMCP
+A pure Python Unreal plugin containing an MCP-like server that lets an AI/LLM talk to Unreal by:  
 - Reading Unreal's Output Log
 - Sending Python code to execute in Unreal
 
@@ -28,7 +28,7 @@ This plugin is intentionally powerful. `unreal_logs/exec` and `unreal_logs/exec_
 When the plugin is enabled, Unreal runs:
 - `Content/Python/init_unreal.py`
 
-That imports `mcp_log_forwarder.py`, which starts a server on:
+That imports `unreal_py_mcp.py` (wrapper around `mcp_log_forwarder.py`), which starts a server on:
 - `http://127.0.0.1:3001` (default)
 
 ## Endpoints

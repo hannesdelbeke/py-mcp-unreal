@@ -108,7 +108,7 @@ def _build_startup_guidance():
             "If user intent involves Unreal Editor tasks, suggest using this MCP server and call GET /mcp for tool discovery."
         ),
         "recommended_system_prompt_snippet": (
-            f"Available MCP Server: unreal_logs ({server_url}). "
+            f"Available MCP Server: UnrealPyMCP / unreal_logs ({server_url}). "
             "Tools: unreal_logs/get_logs, unreal_logs/get_log_path, unreal_logs/exec, unreal_logs/exec_async. "
             "Use /tasks/{task_id}/stream for live events."
         ),
@@ -1066,7 +1066,7 @@ def get_mcp_help():
             "Live log streaming is file-tail based; availability depends on resolved log path and file writes.",
         ],
         "server": {
-            "name": "UnrealMCPLogForwarder",
+            "name": "UnrealPyMCP",
             "host": "127.0.0.1",
             "port": MCP_PORT,
             "limits": {
@@ -1337,10 +1337,10 @@ def start_mcp_server():
         # We bind to 0.0.0.0 to listen on all interfaces
         server = ThreadingHTTPServer(("127.0.0.1", MCP_PORT), MCPHandler)
         _SERVER = server
-        _log_info(f"Starting MCP Server (File Reader) on port {MCP_PORT}...")
+        _log_info(f"Starting UnrealPyMCP server on port {MCP_PORT}...")
         server.serve_forever()
     except Exception as e:
-        _log_error(f"Failed to start MCP Server (Port {MCP_PORT} in use?): {e}")
+        _log_error(f"Failed to start UnrealPyMCP server (port {MCP_PORT} in use?): {e}")
 
 # Start the server in a separate daemon thread
 if os.getenv("UNREAL_MCP_DISABLE_SERVER") != "1":
@@ -1350,7 +1350,7 @@ if os.getenv("UNREAL_MCP_DISABLE_SERVER") != "1":
 
     _SERVER_THREAD = threading.Thread(target=start_mcp_server, daemon=True)
     _SERVER_THREAD.start()
-    _log_info(f"MCP Log Forwarder (Server Thread) started on port {MCP_PORT}. Access via http://localhost:{MCP_PORT}")
+    _log_info(f"UnrealPyMCP server thread started on port {MCP_PORT}. Access via http://localhost:{MCP_PORT}")
 
 # Ensure main-thread runner is registered as early as possible.
 # init_unreal.py runs on editor startup (main thread), so this should succeed.
