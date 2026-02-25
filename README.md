@@ -1,127 +1,160 @@
 # UnrealMCPLogForwarder
-A pure Python Unreal plugin containing a MCP-like server that lets an AI/LLM talk to Unreal by:  
-- Reading Unreal's Output Log
-- Sending Python code to execute in Unreal
 
-There are no pre-programmed commands, it fully relies on your AI executing Unreal Python commands, with no guardrails.
-There may be limits, since Unreal does not expose everything to Python.
+Project plugin that starts a local MCP-like HTTP server inside Unreal Editor so an AI client can:
+- Read Unreal log output
+- Execute Python in the running editor
 
-## Examples
+This plugin is intentionally powerful. `unreal_logs/exec` and `unreal_logs/exec_async` run arbitrary Python in the editor process.
 
-<img width="1394" height="429" alt="image" src="https://github.com/user-attachments/assets/c9f9d773-cb35-4937-a800-f16cf6b8f9f8" />
+## What It Starts
 
-_Asked GPT to create a small maze with cubes_
+When the plugin is enabled, Unreal runs:
+- `Content/Python/init_unreal.py`
 
-<img width="967" height="376" alt="image" src="https://github.com/user-attachments/assets/6de6917f-36a8-48f7-ae23-d5ca87788d5b" />
+That imports `mcp_log_forwarder.py`, which starts a server on:
+- `http://127.0.0.1:3001` (default)
 
-_Asked to create a new red material and apply it to actor MCP_Maze_6_6_
+## Endpoints
 
----
+- `GET /mcp`
+  - Tool discovery
+  - Includes `meta.startup_guidance` for MCP auto-detection and config hints
+- `GET /mcp/help`
+  - Built-in API docs (tools, limits, examples, endpoints)
+- `GET /health`
+  - Server and main-thread runner status
+  - Includes current log resolution and startup guidance
+- `GET /tasks/{task_id}/status`
+  - Poll async execution task state/result
+- `POST /mcp/messages`
+  - Execute a tool with payload: `{"tool": "...", "arguments": {...}}`
 
-<!-- All text below is AI-generated. -->
+## Tools
 
-Expose a small MCP-like HTTP server inside the Unreal Editor so OpenCode can:
+- `unreal_logs/get_logs`
+  - Return last N log lines (default 500, max 5000)
+- `unreal_logs/get_log_path`
+  - Return resolved log file and search paths
+- `unreal_logs/exec`
+  - Execute Python synchronously on Unreal main thread
+  - Supports `timeout` argument
+  - Exposes `report_progress(message, current=None, total=None)` in execution context
+- `unreal_logs/exec_async`
+  - Queue Python execution and return immediately with `task_id`
+  - Poll `GET /tasks/{task_id}/status` for completion
 
-- Read the latest Unreal log lines (tail the log file)
-- Execute arbitrary Python in the running Unreal Editor (for inspection / automation)
+## OpenCode Config
 
-This is a project plugin. Unreal runs `Content/Python/init_unreal.py` automatically when the plugin is enabled.
-
-## What You Get
-
-An HTTP server bound to `127.0.0.1:3001` (configurable) with MCP-like endpoints:
-
-- `GET /mcp` tool discovery
-- `POST /mcp/messages` tool execution
-
-Tools:
-
-- `unreal_logs/get_logs` - return last N lines of the Unreal log
-- `unreal_logs/get_log_path` - show which log file is being used + search paths
-- `unreal_logs/exec` - run Python code inside Unreal and return stdout / result
-  - Note: Unreal editor APIs generally require running on the editor/main thread. The plugin schedules execution accordingly.
-
-## Install (Project Plugin)
-
-1. Copy this folder to your project:
-
-   `<ProjectRoot>/Plugins/UnrealMCPLogForwarder`
-
-2. In the Unreal Editor:
-
-   `Edit -> Plugins` and enable `MCP Log Forwarder`.
-
-3. Restart the Unreal Editor.
-
-You should see startup logs indicating that the server started.
-
-## Configure OpenCode
-
-Add this to your OpenCode config (global example on Windows):
-
-`C:\Users\hannes\.config\opencode\opencode.json`
+Example:
 
 ```json
 {
   "mcp": {
     "unreal_logs": {
       "type": "remote",
-      "url": "http://localhost:3001",
+      "url": "http://127.0.0.1:3001",
       "enabled": true
     }
   }
 }
 ```
 
-Restart OpenCode.
+## Request Examples
 
-## Usage
+Get logs:
 
-In OpenCode prompts:
-
-- Read logs:
-  - `use unreal_logs/get_logs with limit=200`
-- Verify what log file is being tailed:
-  - `use unreal_logs/get_log_path`
-- Execute Python inside Unreal:
-  - `use unreal_logs/exec with code="print('hello from unreal')"`
-  - `use unreal_logs/exec with code="import unreal; len(unreal.EditorLevelLibrary.get_all_level_actors())"`
-
-Example (project name derived from `.uproject` path):
-
-```python
-import os
-import unreal
-
-uproject = unreal.Paths.get_project_file_path()
-project_name = os.path.splitext(os.path.basename(str(uproject)))[0]
-print("project_name", project_name)
-
-# Example: project name + actor count
-actors = unreal.EditorLevelLibrary.get_all_level_actors()
-print({"project": project_name, "actor_count": len(actors)})
+```json
+{
+  "tool": "unreal_logs/get_logs",
+  "arguments": { "limit": 200 }
+}
 ```
+
+Sync exec:
+
+```json
+{
+  "tool": "unreal_logs/exec",
+  "arguments": {
+    "code": "print('hello from unreal')",
+    "timeout": 60
+  }
+}
+```
+
+Async exec:
+
+```json
+{
+  "tool": "unreal_logs/exec_async",
+  "arguments": {
+    "code": "import time\nfor i in range(3):\n    report_progress(f'step {i+1}', i+1, 3)\n    time.sleep(1)\nresult={'done': True}",
+    "timeout": 60
+  }
+}
+```
+
+Then poll:
+
+`GET /tasks/<task_id>/status`
+
+## Structured Errors
+
+HTTP/API errors are returned as JSON:
+
+```json
+{
+  "status": "error",
+  "error_type": "InvalidJson",
+  "message": "Invalid JSON payload: ...",
+  "timestamp": "2026-02-25T09:23:41.032949+00:00"
+}
+```
+
+Execution failures from `unreal_logs/exec` / `exec_async` include:
+- `error_type`, `message`, `stack_trace`
+- `stdout`, `stderr`
+- `unreal_logs` context
+- `timestamp`, `timeout_seconds`
+
+## Config Environment Variables
+
+- `UNREAL_MCP_PORT`
+  - Server port (default `3001`)
+- `UNREAL_MCP_LOG_PATH`
+  - Absolute path to a specific `.log` file
+- `UNREAL_MCP_EXEC_TIMEOUT`
+  - Default sync/async execution timeout seconds (default `60`)
+- `UNREAL_MCP_MAX_EXEC_TIMEOUT`
+  - Maximum allowed timeout seconds (default `300`)
+- `UNREAL_MCP_ERROR_LOG_LINES`
+  - Number of log lines attached to exec error payloads (default `120`)
+- `UNREAL_MCP_DISABLE_SERVER`
+  - Set to `1` to disable server startup
 
 ## Log Path Resolution
 
-The plugin auto-detects the current log file:
+Resolution order:
+1. Explicit `path` argument (tool call)
+2. `UNREAL_MCP_LOG_PATH`
+3. `<Project>/Saved/Logs/*.log` (preferred)
+4. `%LOCALAPPDATA%/UnrealEngine/*/Saved/Logs/*.log`
+5. `%LOCALAPPDATA%/<ProjectName>/Saved/Logs/*.log`
 
-1. Preferred: `<Project>/Saved/Logs/*.log` (via Unreal API)
-2. Windows fallback: `%LOCALAPPDATA%\UnrealEngine\*\Saved\Logs\*.log`
-3. Windows fallback: `%LOCALAPPDATA%\<ProjectName>\Saved\Logs\*.log`
+## Notes on Async Behavior
 
-Overrides:
-
-- Env var: `UNREAL_MCP_LOG_PATH` (absolute path to a specific `.log` file)
-- Tool arg: `path` (per-call override for `get_logs` / `get_log_path`)
-
-## Security Notes
-
-- The server binds to `127.0.0.1` only.
-- `unreal_logs/exec` is intentionally powerful: it runs arbitrary Python in the Editor process.
-  Only use this on trusted machines and do not expose the port to the network.
+- Async is non-blocking for the MCP client (you get a `task_id` immediately).
+- Unreal Python still executes on Unreal's main thread for editor safety.
+- Use `exec_async` + polling to avoid HTTP wait timeouts for long jobs.
 
 ## Troubleshooting
 
-- If `GET /mcp` times out, confirm the plugin is enabled and the Editor was restarted.
-- If log resolution fails, call `unreal_logs/get_log_path` to see what paths were searched.
+- If `/mcp` is down:
+  - verify plugin enabled
+  - verify Python plugin enabled
+  - restart Unreal Editor
+- If logs cannot be resolved:
+  - call `unreal_logs/get_log_path`
+  - set `UNREAL_MCP_LOG_PATH`
+- For capability/introspection:
+  - call `/mcp/help` and `/health`
