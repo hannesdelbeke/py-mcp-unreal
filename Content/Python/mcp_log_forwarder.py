@@ -4,6 +4,7 @@ import threading
 import http.server
 import socketserver
 import glob
+import time
 
 try:
     import unreal
@@ -20,6 +21,8 @@ LOG_PATH_OVERRIDE = os.getenv("UNREAL_MCP_LOG_PATH")
 
 RETURN_LOG_LINES = 500  # Default lines to return per tool call
 LOG_LINE_LIMIT = 5000  # Safety cap on returned lines
+DEFAULT_EXEC_TIMEOUT = int(os.getenv("UNREAL_MCP_EXEC_TIMEOUT", "60"))
+MAX_EXEC_TIMEOUT = int(os.getenv("UNREAL_MCP_MAX_EXEC_TIMEOUT", "300"))
 
 _CACHED_LOG_PATH = None
 _CACHED_SEARCH = None
@@ -35,6 +38,14 @@ _TICK_KIND = None  # "editor", "slate_post", or "slate_pre"
 
 _SERVER = None
 _SERVER_THREAD = None
+
+
+def _clamp_exec_timeout(timeout):
+    try:
+        timeout = int(timeout)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_EXEC_TIMEOUT
+    return max(1, min(timeout, MAX_EXEC_TIMEOUT))
 
 
 def _log_info(msg):
@@ -360,13 +371,15 @@ def get_log_path(path=None):
     }
 
 
-def exec_python(code, mode="exec"):
+def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
     """Execute Python inside Unreal and return output.
 
     Parameters:
     - code: python source code
     - mode: "exec" (default) or "eval"
     """
+
+    timeout = _clamp_exec_timeout(timeout)
 
     if unreal is None:
         return {
@@ -391,7 +404,20 @@ def exec_python(code, mode="exec"):
     def _run():
         stdout = io.StringIO()
         stderr = io.StringIO()
-        g = {"unreal": unreal}
+        progress_events = []
+
+        def report_progress(message, current=None, total=None):
+            progress_events.append(
+                {
+                    "type": "progress",
+                    "message": str(message),
+                    "current": current,
+                    "total": total,
+                    "timestamp": time.time(),
+                }
+            )
+
+        g = {"unreal": unreal, "report_progress": report_progress}
         l = {}
 
         try:
@@ -408,6 +434,8 @@ def exec_python(code, mode="exec"):
                 "stdout": stdout.getvalue(),
                 "stderr": stderr.getvalue(),
                 "result": result,
+                "progress_events": progress_events,
+                "timeout_seconds": timeout,
             }
         except Exception as e:
             import traceback
@@ -418,6 +446,8 @@ def exec_python(code, mode="exec"):
                 "stderr": stderr.getvalue(),
                 "error": str(e),
                 "traceback": traceback.format_exc(),
+                "progress_events": progress_events,
+                "timeout_seconds": timeout,
             }
 
     # Unreal editor APIs generally must run on the main thread.
@@ -478,7 +508,7 @@ def exec_python(code, mode="exec"):
         _MAIN_THREAD_QUEUE.append(_job)
 
     # Wait for result (avoid hanging the server thread forever)
-    if not done.wait(timeout=10.0):
+    if not done.wait(timeout=float(timeout)):
         current_ident = _safe_get_ident()
         return {
             "ok": False,
@@ -486,6 +516,7 @@ def exec_python(code, mode="exec"):
             "stdout": "",
             "stderr": "",
             "error": "Timed out waiting for main-thread execution",
+            "timeout_seconds": timeout,
             "thread": {
                 "current_ident": current_ident,
                 "runner_ident": _MAIN_THREAD_IDENT,
@@ -594,7 +625,7 @@ MCP_TOOLS = {
     }
     ,
     "unreal_logs/exec": {
-        "description": "Execute arbitrary Python in the running Unreal Editor process. Returns stdout/stderr/result.",
+        "description": "Execute arbitrary Python in the running Unreal Editor process. Returns stdout/stderr/result and progress events.",
         "function": exec_python,
         "parameters": {
             "type": "object",
@@ -606,6 +637,10 @@ MCP_TOOLS = {
                 "mode": {
                     "type": "string",
                     "description": "Execution mode: 'exec' (default) or 'eval'."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": f"Execution timeout in seconds (default {DEFAULT_EXEC_TIMEOUT}, max {MAX_EXEC_TIMEOUT})."
                 }
             },
             "required": ["code"]
