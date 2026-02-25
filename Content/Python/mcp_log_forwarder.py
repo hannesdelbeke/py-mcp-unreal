@@ -695,6 +695,96 @@ MCP_TOOLS = {
 }
 
 
+def _tool_definitions_with_runtime_context():
+    resolved, _ = _resolve_log_file_path(use_cache=True)
+    tool_definitions = []
+    for name, tool_data in MCP_TOOLS.items():
+        desc = tool_data["description"]
+        if name == "unreal_logs/get_logs" and resolved:
+            desc = desc + f" (current: {resolved})"
+
+        tool_definitions.append(
+            {
+                "name": name,
+                "description": desc,
+                "parameters": tool_data["parameters"],
+            }
+        )
+    return tool_definitions
+
+
+def get_mcp_help():
+    return {
+        "status": "ok",
+        "timestamp": _utc_now_iso(),
+        "server": {
+            "name": "UnrealMCPLogForwarder",
+            "host": "127.0.0.1",
+            "port": MCP_PORT,
+            "limits": {
+                "default_log_lines": RETURN_LOG_LINES,
+                "max_log_lines": LOG_LINE_LIMIT,
+                "default_exec_timeout_seconds": DEFAULT_EXEC_TIMEOUT,
+                "max_exec_timeout_seconds": MAX_EXEC_TIMEOUT,
+            },
+        },
+        "endpoints": [
+            {"method": "GET", "path": "/mcp", "description": "Tool discovery."},
+            {"method": "GET", "path": "/mcp/help", "description": "Tool and endpoint usage documentation."},
+            {"method": "GET", "path": "/health", "description": "Server health and main-thread runner status."},
+            {"method": "POST", "path": "/mcp/messages", "description": "Run a tool call with payload {tool, arguments}."},
+        ],
+        "examples": [
+            {
+                "description": "Execute Python in Unreal",
+                "request": {
+                    "tool": "unreal_logs/exec",
+                    "arguments": {"code": "print('hello from unreal')", "timeout": 60},
+                },
+            },
+            {
+                "description": "Get last 200 log lines",
+                "request": {
+                    "tool": "unreal_logs/get_logs",
+                    "arguments": {"limit": 200},
+                },
+            },
+            {
+                "description": "Get resolved log path",
+                "request": {
+                    "tool": "unreal_logs/get_log_path",
+                    "arguments": {},
+                },
+            },
+        ],
+        "tools": _tool_definitions_with_runtime_context(),
+    }
+
+
+def get_health():
+    resolved_log, _ = _resolve_log_file_path(use_cache=True)
+    return {
+        "status": "ok",
+        "timestamp": _utc_now_iso(),
+        "server": {
+            "listening": _SERVER is not None,
+            "thread_alive": bool(_SERVER_THREAD is not None and _SERVER_THREAD.is_alive()),
+            "port": MCP_PORT,
+        },
+        "main_thread_runner": {
+            "initialized": _MAIN_THREAD_INIT,
+            "ready": _MAIN_THREAD_READY,
+            "runner_ident": _MAIN_THREAD_IDENT,
+            "runner_kind": _TICK_KIND,
+            "queued_jobs": len(_MAIN_THREAD_QUEUE),
+        },
+        "log_resolution": {
+            "project": _get_project_name(),
+            "resolved_log": resolved_log,
+        },
+    }
+
+
 # --- MCP HTTP Server Implementation ---
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
@@ -705,28 +795,13 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        """Handle tool discovery request (GET /mcp)."""
+        """Handle tool discovery and diagnostics endpoints."""
         if self.path == '/mcp':
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            
-            resolved, _ = _resolve_log_file_path(use_cache=True)
-
-            tool_definitions = []
-            for name, tool_data in MCP_TOOLS.items():
-                desc = tool_data["description"]
-                if name == "unreal_logs/get_logs" and resolved:
-                    desc = desc + f" (current: {resolved})"
-
-                tool_definitions.append({
-                    "name": name,
-                    "description": desc,
-                    "parameters": tool_data["parameters"],
-                })
-                
-            response = {"tools": tool_definitions}
-            self.wfile.write(json.dumps(response).encode('utf-8'))
+            self._send_json(200, {"tools": _tool_definitions_with_runtime_context()})
+        elif self.path == '/mcp/help':
+            self._send_json(200, get_mcp_help())
+        elif self.path == '/health':
+            self._send_json(200, get_health())
         else:
             self._send_error_json(404, "NotFound", f"Path not found: {self.path}")
 
