@@ -7,6 +7,7 @@ import glob
 import time
 import datetime
 import traceback
+import uuid
 
 try:
     import unreal
@@ -41,6 +42,8 @@ _TICK_KIND = None  # "editor", "slate_post", or "slate_pre"
 
 _SERVER = None
 _SERVER_THREAD = None
+_TASKS = {}
+_TASKS_LOCK = threading.Lock()
 
 
 def _utc_now_iso():
@@ -433,62 +436,8 @@ def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
     except Exception:
         code_str = code
 
-    import io
-    import contextlib
-
     def _run():
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        progress_events = []
-
-        def report_progress(message, current=None, total=None):
-            progress_events.append(
-                {
-                    "type": "progress",
-                    "message": str(message),
-                    "current": current,
-                    "total": total,
-                    "timestamp": time.time(),
-                }
-            )
-
-        g = {"unreal": unreal, "report_progress": report_progress}
-        l = {}
-
-        try:
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                if mode == "eval":
-                    result = eval(code_str, g, l)
-                else:
-                    exec(code_str, g, l)
-                    result = l.get("result", None)
-
-            return {
-                "ok": True,
-                "status": "success",
-                "mode": mode,
-                "stdout": stdout.getvalue(),
-                "stderr": stderr.getvalue(),
-                "result": result,
-                "progress_events": progress_events,
-                "timeout_seconds": timeout,
-                "timestamp": _utc_now_iso(),
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "status": "error",
-                "error_type": type(e).__name__,
-                "message": str(e),
-                "mode": mode,
-                "stdout": stdout.getvalue(),
-                "stderr": stderr.getvalue(),
-                "stack_trace": traceback.format_exc(),
-                "progress_events": progress_events,
-                "unreal_logs": get_recent_logs(),
-                "timeout_seconds": timeout,
-                "timestamp": _utc_now_iso(),
-            }
+        return _execute_code_now(code_str=code_str, mode=mode, timeout=timeout)
 
     # Unreal editor APIs generally must run on the main thread.
     _ensure_main_thread_runner()
@@ -574,6 +523,64 @@ def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
     return out
 
 
+def _execute_code_now(code_str, mode, timeout):
+    import io
+    import contextlib
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    progress_events = []
+
+    def report_progress(message, current=None, total=None):
+        progress_events.append(
+            {
+                "type": "progress",
+                "message": str(message),
+                "current": current,
+                "total": total,
+                "timestamp": time.time(),
+            }
+        )
+
+    g = {"unreal": unreal, "report_progress": report_progress}
+    l = {}
+
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            if mode == "eval":
+                result = eval(code_str, g, l)
+            else:
+                exec(code_str, g, l)
+                result = l.get("result", None)
+
+        return {
+            "ok": True,
+            "status": "success",
+            "mode": mode,
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "result": result,
+            "progress_events": progress_events,
+            "timeout_seconds": timeout,
+            "timestamp": _utc_now_iso(),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "status": "error",
+            "error_type": type(e).__name__,
+            "message": str(e),
+            "mode": mode,
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "stack_trace": traceback.format_exc(),
+            "progress_events": progress_events,
+            "unreal_logs": get_recent_logs(),
+            "timeout_seconds": timeout,
+            "timestamp": _utc_now_iso(),
+        }
+
+
 def _port_is_open(host, port, timeout=0.15):
     try:
         import socket
@@ -637,6 +644,94 @@ def _unregister_tick():
     except Exception:
         pass
 
+
+def _create_task_record(mode, timeout):
+    task_id = uuid.uuid4().hex
+    record = {
+        "task_id": task_id,
+        "status": "queued",
+        "mode": mode,
+        "timeout_seconds": timeout,
+        "created_at": _utc_now_iso(),
+        "started_at": None,
+        "completed_at": None,
+        "result": None,
+    }
+    with _TASKS_LOCK:
+        _TASKS[task_id] = record
+    return task_id
+
+
+def _get_task_record(task_id):
+    with _TASKS_LOCK:
+        rec = _TASKS.get(task_id)
+        if rec is None:
+            return None
+        # Return a shallow copy to avoid races in serialization.
+        return dict(rec)
+
+
+def exec_python_async(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
+    timeout = _clamp_exec_timeout(timeout)
+
+    if unreal is None:
+        return _structured_error(
+            error_type="UnrealUnavailable",
+            message="unreal module not available",
+            status_code=503,
+        )
+
+    if code is None:
+        return _structured_error(
+            error_type="ValidationError",
+            message="Missing required argument: code",
+            status_code=400,
+        )
+
+    try:
+        code_str = str(code)
+    except Exception:
+        code_str = code
+
+    _ensure_main_thread_runner()
+    if not _MAIN_THREAD_READY:
+        return _structured_error(
+            error_type="MainThreadUnavailable",
+            message="Main-thread runner not available; cannot queue async Unreal execution",
+            status_code=503,
+        )
+
+    task_id = _create_task_record(mode=mode, timeout=timeout)
+
+    def _job():
+        with _TASKS_LOCK:
+            rec = _TASKS.get(task_id)
+            if rec is None:
+                return
+            rec["status"] = "running"
+            rec["started_at"] = _utc_now_iso()
+
+        result = _execute_code_now(code_str=code_str, mode=mode, timeout=timeout)
+
+        with _TASKS_LOCK:
+            rec = _TASKS.get(task_id)
+            if rec is None:
+                return
+            rec["status"] = "completed" if result.get("ok") else "failed"
+            rec["result"] = result
+            rec["completed_at"] = _utc_now_iso()
+
+    with _MAIN_THREAD_LOCK:
+        _MAIN_THREAD_QUEUE.append(_job)
+
+    return {
+        "status": "accepted",
+        "task_id": task_id,
+        "mode": mode,
+        "timeout_seconds": timeout,
+        "created_at": _utc_now_iso(),
+    }
+
 # The MCP Tool Definition (for discovery)
 MCP_TOOLS = {
     "unreal_logs/get_logs": {
@@ -691,6 +786,28 @@ MCP_TOOLS = {
             },
             "required": ["code"]
         }
+    },
+    "unreal_logs/exec_async": {
+        "description": "Queue Python execution in Unreal Editor and return immediately with a task_id. Poll /tasks/{task_id}/status for completion.",
+        "function": exec_python_async,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source code to execute asynchronously."
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Execution mode: 'exec' (default) or 'eval'."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": f"Execution timeout in seconds (default {DEFAULT_EXEC_TIMEOUT}, max {MAX_EXEC_TIMEOUT})."
+                }
+            },
+            "required": ["code"]
+        }
     }
 }
 
@@ -732,6 +849,7 @@ def get_mcp_help():
             {"method": "GET", "path": "/mcp", "description": "Tool discovery."},
             {"method": "GET", "path": "/mcp/help", "description": "Tool and endpoint usage documentation."},
             {"method": "GET", "path": "/health", "description": "Server health and main-thread runner status."},
+            {"method": "GET", "path": "/tasks/{task_id}/status", "description": "Poll async task status and result."},
             {"method": "POST", "path": "/mcp/messages", "description": "Run a tool call with payload {tool, arguments}."},
         ],
         "examples": [
@@ -802,6 +920,17 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, get_mcp_help())
         elif self.path == '/health':
             self._send_json(200, get_health())
+        elif self.path.startswith('/tasks/') and self.path.endswith('/status'):
+            parts = self.path.strip('/').split('/')
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "status":
+                task_id = parts[1]
+                rec = _get_task_record(task_id)
+                if rec is None:
+                    self._send_error_json(404, "TaskNotFound", f"Task not found: {task_id}")
+                else:
+                    self._send_json(200, rec)
+            else:
+                self._send_error_json(404, "NotFound", f"Path not found: {self.path}")
         else:
             self._send_error_json(404, "NotFound", f"Path not found: {self.path}")
 
