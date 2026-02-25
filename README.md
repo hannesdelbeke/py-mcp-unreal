@@ -1,4 +1,21 @@
 # UnrealMCPLogForwarder
+A pure Python Unreal plugin containing a MCP-like server that lets an AI/LLM talk to Unreal by:  
+- Reading Unreal's Output Log
+- Sending Python code to execute in Unreal
+
+There are no pre-programmed commands, it fully relies on your AI executing Unreal Python commands, with no guardrails.
+There may be limits, since Unreal does not expose everything to Python.
+Project plugin that starts a local MCP-like HTTP server inside Unreal Editor so an AI client can:
+
+<img width="1394" height="429" alt="image" src="https://github.com/user-attachments/assets/c9f9d773-cb35-4937-a800-f16cf6b8f9f8" />
+
+_Asked GPT to create a small maze with cubes_
+
+<img width="967" height="376" alt="image" src="https://github.com/user-attachments/assets/6de6917f-36a8-48f7-ae23-d5ca87788d5b" />
+
+_Asked to create a new red material and apply it to actor MCP_Maze_6_6_
+
+---
 
 Project plugin that starts a local MCP-like HTTP server inside Unreal Editor so an AI client can:
 - Read Unreal log output
