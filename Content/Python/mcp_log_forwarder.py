@@ -8,6 +8,7 @@ import time
 import datetime
 import traceback
 import uuid
+import urllib.parse
 
 try:
     import unreal
@@ -27,6 +28,9 @@ LOG_LINE_LIMIT = 5000  # Safety cap on returned lines
 DEFAULT_EXEC_TIMEOUT = int(os.getenv("UNREAL_MCP_EXEC_TIMEOUT", "60"))
 MAX_EXEC_TIMEOUT = int(os.getenv("UNREAL_MCP_MAX_EXEC_TIMEOUT", "300"))
 RECENT_ERROR_LOG_LINES = int(os.getenv("UNREAL_MCP_ERROR_LOG_LINES", "120"))
+TASK_EVENT_BUFFER_SIZE = int(os.getenv("UNREAL_MCP_TASK_EVENT_BUFFER", "2000"))
+TASK_SSE_HEARTBEAT_SECONDS = float(os.getenv("UNREAL_MCP_SSE_HEARTBEAT_SECONDS", "15"))
+TASK_LOG_TAIL_POLL_SECONDS = float(os.getenv("UNREAL_MCP_LOG_TAIL_POLL_SECONDS", "0.25"))
 
 _CACHED_LOG_PATH = None
 _CACHED_SEARCH = None
@@ -44,13 +48,17 @@ _SERVER = None
 _SERVER_THREAD = None
 _TASKS = {}
 _TASKS_LOCK = threading.Lock()
+_TASK_EVENTS = {}
+_TASK_EVENT_LOCK = threading.Lock()
 
 
 def _utc_now_iso():
+    """Return an RFC3339-ish UTC timestamp for consistent API/event records."""
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def _clamp_exec_timeout(timeout):
+    """Normalize user timeout input so execution cannot run unbounded."""
     try:
         timeout = int(timeout)
     except (TypeError, ValueError):
@@ -59,6 +67,7 @@ def _clamp_exec_timeout(timeout):
 
 
 def _structured_error(error_type, message, status_code=500, details=None):
+    """Build a stable error envelope so clients can branch on error_type."""
     out = {
         "status": "error",
         "error_type": str(error_type),
@@ -72,6 +81,7 @@ def _structured_error(error_type, message, status_code=500, details=None):
 
 
 def _get_project_file_path():
+    """Expose project file path when available to improve diagnostics."""
     if unreal is None:
         return None
     try:
@@ -84,6 +94,7 @@ def _get_project_file_path():
 
 
 def _build_startup_guidance():
+    """Return machine-readable hints used by clients for MCP auto-discovery UX."""
     server_url = f"http://127.0.0.1:{MCP_PORT}"
     return {
         "capability_keywords": [
@@ -98,7 +109,8 @@ def _build_startup_guidance():
         ),
         "recommended_system_prompt_snippet": (
             f"Available MCP Server: unreal_logs ({server_url}). "
-            "Tools: unreal_logs/get_logs, unreal_logs/get_log_path, unreal_logs/exec, unreal_logs/exec_async."
+            "Tools: unreal_logs/get_logs, unreal_logs/get_log_path, unreal_logs/exec, unreal_logs/exec_async. "
+            "Use /tasks/{task_id}/stream for live events."
         ),
         "opencode_config_example": {
             "mcp": {
@@ -110,6 +122,143 @@ def _build_startup_guidance():
             }
         },
     }
+
+
+def _init_task_event_bus(task_id):
+    """Create a bounded event bus per task for SSE streaming and polling cursors."""
+    with _TASK_EVENT_LOCK:
+        _TASK_EVENTS[task_id] = {
+            "events": [],
+            "next_seq": 1,
+            "dropped": 0,
+            "condition": threading.Condition(),
+            "closed": False,
+        }
+
+
+def _publish_task_event(task_id, event_type, payload):
+    """Append an event to a task stream and wake SSE subscribers."""
+    with _TASK_EVENT_LOCK:
+        bus = _TASK_EVENTS.get(task_id)
+    if bus is None:
+        return
+
+    with bus["condition"]:
+        seq = bus["next_seq"]
+        bus["next_seq"] = seq + 1
+        bus["events"].append(
+            {
+                "seq": seq,
+                "type": str(event_type),
+                "timestamp": _utc_now_iso(),
+                "payload": payload,
+            }
+        )
+        if len(bus["events"]) > TASK_EVENT_BUFFER_SIZE:
+            drop_count = len(bus["events"]) - TASK_EVENT_BUFFER_SIZE
+            bus["events"] = bus["events"][drop_count:]
+            bus["dropped"] += drop_count
+        bus["condition"].notify_all()
+
+
+def _close_task_event_bus(task_id):
+    """Mark stream closed so SSE readers can terminate once backlog is flushed."""
+    with _TASK_EVENT_LOCK:
+        bus = _TASK_EVENTS.get(task_id)
+    if bus is None:
+        return
+    with bus["condition"]:
+        bus["closed"] = True
+        bus["condition"].notify_all()
+
+
+def _wait_for_task_events(task_id, after_seq, timeout):
+    """Block until new events arrive (or timeout) to support SSE long-poll semantics."""
+    with _TASK_EVENT_LOCK:
+        bus = _TASK_EVENTS.get(task_id)
+    if bus is None:
+        return None
+
+    with bus["condition"]:
+        has_new = any(int(evt["seq"]) > int(after_seq) for evt in bus["events"])
+        if not has_new and not bus["closed"]:
+            bus["condition"].wait(timeout=timeout)
+        events = [evt for evt in bus["events"] if int(evt["seq"]) > int(after_seq)]
+        return {
+            "events": events,
+            "next_seq": bus["next_seq"],
+            "dropped": bus["dropped"],
+            "closed": bus["closed"],
+        }
+
+
+class _StreamingCapture:
+    """Capture stdout/stderr while also emitting incremental task events for streaming."""
+
+    def __init__(self, task_id, stream_name):
+        self.task_id = task_id
+        self.stream_name = stream_name
+        self._buf = []
+
+    def write(self, data):
+        text = str(data)
+        self._buf.append(text)
+        if self.task_id and text:
+            _publish_task_event(self.task_id, self.stream_name, {"text": text})
+        return len(text)
+
+    def flush(self):
+        return None
+
+    def getvalue(self):
+        return "".join(self._buf)
+
+
+def _tail_log_for_task(task_id, stop_event, explicit_path=None):
+    """Tail the resolved log file via disk offsets and publish only newly appended lines."""
+    path, _ = _resolve_log_file_path(explicit_path=explicit_path, use_cache=True)
+    if not path:
+        _publish_task_event(task_id, "log_info", {"message": "No log file resolved for streaming"})
+        return
+
+    _publish_task_event(task_id, "log_info", {"message": "Streaming log tail started", "path": path})
+
+    position = 0
+    partial = ""
+    try:
+        position = os.path.getsize(path)
+    except Exception:
+        position = 0
+
+    while not stop_event.is_set():
+        try:
+            if not os.path.isfile(path):
+                time.sleep(TASK_LOG_TAIL_POLL_SECONDS)
+                continue
+
+            size = os.path.getsize(path)
+            if size < position:
+                # Log rotated or truncated; restart from start of new file.
+                position = 0
+                partial = ""
+
+            if size > position:
+                with open(path, "rb") as f:
+                    f.seek(position)
+                    data = f.read(size - position)
+                position = size
+                text = data.decode("utf-8", errors="ignore")
+                if text:
+                    text = partial + text
+                    lines = text.split("\n")
+                    partial = lines[-1]
+                    for line in lines[:-1]:
+                        if line:
+                            _publish_task_event(task_id, "log_line", {"line": line})
+            time.sleep(TASK_LOG_TAIL_POLL_SECONDS)
+        except Exception as e:
+            _publish_task_event(task_id, "log_error", {"message": str(e)})
+            time.sleep(TASK_LOG_TAIL_POLL_SECONDS)
 
 
 def _log_info(msg):
@@ -478,7 +627,7 @@ def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
         code_str = code
 
     def _run():
-        return _execute_code_now(code_str=code_str, mode=mode, timeout=timeout)
+        return _execute_code_now(code_str=code_str, mode=mode, timeout=timeout, task_id=None)
 
     # Unreal editor APIs generally must run on the main thread.
     _ensure_main_thread_runner()
@@ -564,24 +713,34 @@ def exec_python(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
     return out
 
 
-def _execute_code_now(code_str, mode, timeout):
-    import io
+def _execute_code_now(code_str, mode, timeout, task_id=None):
+    """Execute user code and produce both final aggregate output and streaming events."""
     import contextlib
 
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    stdout = _StreamingCapture(task_id=task_id, stream_name="stdout")
+    stderr = _StreamingCapture(task_id=task_id, stream_name="stderr")
     progress_events = []
 
     def report_progress(message, current=None, total=None):
-        progress_events.append(
-            {
-                "type": "progress",
-                "message": str(message),
-                "current": current,
-                "total": total,
-                "timestamp": time.time(),
-            }
-        )
+        event = {
+            "type": "progress",
+            "message": str(message),
+            "current": current,
+            "total": total,
+            "timestamp": time.time(),
+        }
+        progress_events.append(event)
+        if task_id:
+            _publish_task_event(
+                task_id,
+                "progress",
+                {
+                    "message": event["message"],
+                    "current": event["current"],
+                    "total": event["total"],
+                    "ts": event["timestamp"],
+                },
+            )
 
     g = {"unreal": unreal, "report_progress": report_progress}
     l = {}
@@ -622,17 +781,8 @@ def _execute_code_now(code_str, mode, timeout):
         }
 
 
-def _port_is_open(host, port, timeout=0.15):
-    try:
-        import socket
-
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
 def _stop_server():
+    """Stop old HTTP server instances on module reload to avoid port conflicts."""
     global _SERVER, _SERVER_THREAD
 
     srv = _SERVER
@@ -658,6 +808,7 @@ def _stop_server():
 
 
 def _unregister_tick():
+    """Unregister previous main-thread tick callback when the module reloads."""
     global _TICK_HANDLE, _TICK_KIND
 
     if unreal is None:
@@ -687,6 +838,7 @@ def _unregister_tick():
 
 
 def _create_task_record(mode, timeout):
+    """Create task metadata and matching event bus used by status + stream endpoints."""
     task_id = uuid.uuid4().hex
     record = {
         "task_id": task_id,
@@ -697,13 +849,20 @@ def _create_task_record(mode, timeout):
         "started_at": None,
         "completed_at": None,
         "result": None,
+        "stream": {
+            "events_path": f"/tasks/{task_id}/stream",
+            "status_path": f"/tasks/{task_id}/status",
+        },
     }
     with _TASKS_LOCK:
         _TASKS[task_id] = record
+    _init_task_event_bus(task_id)
+    _publish_task_event(task_id, "task_status", {"status": "queued"})
     return task_id
 
 
 def _get_task_record(task_id):
+    """Return a shallow copy so API serialization never mutates shared state."""
     with _TASKS_LOCK:
         rec = _TASKS.get(task_id)
         if rec is None:
@@ -713,6 +872,7 @@ def _get_task_record(task_id):
 
 
 def exec_python_async(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
+    """Queue main-thread execution and expose live events over `/tasks/{id}/stream`."""
     timeout = _clamp_exec_timeout(timeout)
 
     if unreal is None:
@@ -745,22 +905,43 @@ def exec_python_async(code, mode="exec", timeout=DEFAULT_EXEC_TIMEOUT):
     task_id = _create_task_record(mode=mode, timeout=timeout)
 
     def _job():
+        log_stop = threading.Event()
+        log_thread = threading.Thread(
+            target=_tail_log_for_task,
+            kwargs={"task_id": task_id, "stop_event": log_stop},
+            daemon=True,
+        )
+        log_thread.start()
+
         with _TASKS_LOCK:
             rec = _TASKS.get(task_id)
             if rec is None:
+                log_stop.set()
                 return
             rec["status"] = "running"
             rec["started_at"] = _utc_now_iso()
+        _publish_task_event(task_id, "task_status", {"status": "running"})
 
-        result = _execute_code_now(code_str=code_str, mode=mode, timeout=timeout)
+        result = _execute_code_now(code_str=code_str, mode=mode, timeout=timeout, task_id=task_id)
 
         with _TASKS_LOCK:
             rec = _TASKS.get(task_id)
             if rec is None:
+                log_stop.set()
                 return
             rec["status"] = "completed" if result.get("ok") else "failed"
             rec["result"] = result
             rec["completed_at"] = _utc_now_iso()
+            status_value = rec["status"]
+
+        _publish_task_event(task_id, "task_result", result)
+        _publish_task_event(task_id, "task_status", {"status": status_value})
+        log_stop.set()
+        try:
+            log_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        _close_task_event_bus(task_id)
 
     with _MAIN_THREAD_LOCK:
         _MAIN_THREAD_QUEUE.append(_job)
@@ -854,6 +1035,7 @@ MCP_TOOLS = {
 
 
 def _tool_definitions_with_runtime_context():
+    """Return tool schemas with runtime hints (current log path) for discoverability."""
     resolved, _ = _resolve_log_file_path(use_cache=True)
     tool_definitions = []
     for name, tool_data in MCP_TOOLS.items():
@@ -872,6 +1054,7 @@ def _tool_definitions_with_runtime_context():
 
 
 def get_mcp_help():
+    """Return self-documentation so clients can discover API usage without source inspection."""
     return {
         "status": "ok",
         "timestamp": _utc_now_iso(),
@@ -891,7 +1074,8 @@ def get_mcp_help():
             {"method": "GET", "path": "/mcp", "description": "Tool discovery."},
             {"method": "GET", "path": "/mcp/help", "description": "Tool and endpoint usage documentation."},
             {"method": "GET", "path": "/health", "description": "Server health and main-thread runner status."},
-            {"method": "GET", "path": "/tasks/{task_id}/status", "description": "Poll async task status and result."},
+            {"method": "GET", "path": "/tasks/{task_id}/status", "description": "Poll async task status/result (fallback when SSE not available)."},
+            {"method": "GET", "path": "/tasks/{task_id}/stream", "description": "SSE stream of live task events (progress/stdout/stderr/log tail/status)."},
             {"method": "POST", "path": "/mcp/messages", "description": "Run a tool call with payload {tool, arguments}."},
         ],
         "examples": [
@@ -922,6 +1106,7 @@ def get_mcp_help():
 
 
 def get_health():
+    """Return runtime diagnostics needed to debug startup and execution routing."""
     resolved_log, _ = _resolve_log_file_path(use_cache=True)
     return {
         "status": "ok",
@@ -957,8 +1142,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        """Handle tool discovery and diagnostics endpoints."""
-        if self.path == '/mcp':
+        """Route discovery/health/task requests and serve SSE streams for live task events."""
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query or "")
+
+        if path == '/mcp':
             self._send_json(
                 200,
                 {
@@ -968,12 +1157,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                     },
                 },
             )
-        elif self.path == '/mcp/help':
+        elif path == '/mcp/help':
             self._send_json(200, get_mcp_help())
-        elif self.path == '/health':
+        elif path == '/health':
             self._send_json(200, get_health())
-        elif self.path.startswith('/tasks/') and self.path.endswith('/status'):
-            parts = self.path.strip('/').split('/')
+        elif path.startswith('/tasks/') and path.endswith('/status'):
+            parts = path.strip('/').split('/')
             if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "status":
                 task_id = parts[1]
                 rec = _get_task_record(task_id)
@@ -982,13 +1171,40 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     self._send_json(200, rec)
             else:
-                self._send_error_json(404, "NotFound", f"Path not found: {self.path}")
+                self._send_error_json(404, "NotFound", f"Path not found: {path}")
+        elif path.startswith('/tasks/') and path.endswith('/stream'):
+            parts = path.strip('/').split('/')
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "stream":
+                task_id = parts[1]
+                if _get_task_record(task_id) is None:
+                    self._send_error_json(404, "TaskNotFound", f"Task not found: {task_id}")
+                    return
+
+                cursor = 0
+                if "cursor" in query and query["cursor"]:
+                    try:
+                        cursor = int(query["cursor"][0])
+                    except (TypeError, ValueError):
+                        cursor = 0
+                if cursor <= 0:
+                    last_id = self.headers.get("Last-Event-ID")
+                    try:
+                        if last_id:
+                            cursor = int(last_id)
+                    except (TypeError, ValueError):
+                        cursor = 0
+
+                self._stream_task_events(task_id=task_id, cursor=cursor)
+            else:
+                self._send_error_json(404, "NotFound", f"Path not found: {path}")
         else:
-            self._send_error_json(404, "NotFound", f"Path not found: {self.path}")
+            self._send_error_json(404, "NotFound", f"Path not found: {path}")
 
     def do_POST(self):
-        """Handle tool call request (POST /mcp/messages)."""
-        if self.path == '/mcp/messages':
+        """Execute tool calls and return result payloads."""
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        if path == '/mcp/messages':
             try:
                 content_length = int(self.headers.get('Content-Length', 0))
                 if content_length <= 0:
@@ -1031,32 +1247,78 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 _log_error(f"MCP Server error during POST: {e}")
                 self._send_error_json(500, "ServerError", str(e), details={"stack_trace": traceback.format_exc()})
         else:
-            self._send_error_json(404, "NotFound", f"Path not found: {self.path}")
+            self._send_error_json(404, "NotFound", f"Path not found: {path}")
+
+    def _stream_task_events(self, task_id, cursor):
+        """Serve a task's event bus over SSE so clients receive live progress/log/output."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        next_cursor = int(cursor)
+        self._send_sse_event(event="hello", event_id=0, payload={"task_id": task_id})
+
+        try:
+            while True:
+                snapshot = _wait_for_task_events(
+                    task_id=task_id,
+                    after_seq=next_cursor,
+                    timeout=TASK_SSE_HEARTBEAT_SECONDS,
+                )
+                if snapshot is None:
+                    self._send_sse_event(event="error", event_id=next_cursor, payload={"message": "task not found"})
+                    break
+
+                events = snapshot["events"]
+                if events:
+                    for evt in events:
+                        self._send_sse_event(event=evt["type"], event_id=evt["seq"], payload=evt)
+                        next_cursor = int(evt["seq"])
+                    continue
+
+                # Keep connection alive during idle periods.
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                if snapshot["closed"]:
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as e:
+            try:
+                self._send_sse_event(event="error", event_id=next_cursor, payload={"message": str(e)})
+            except Exception:
+                pass
+
+    def _send_sse_event(self, event, event_id, payload):
+        """Write one SSE event frame."""
+        frame = []
+        frame.append(f"id: {int(event_id)}")
+        frame.append(f"event: {str(event)}")
+        frame.append(f"data: {json.dumps(payload)}")
+        frame.append("")
+        data = ("\n".join(frame) + "\n").encode("utf-8", errors="ignore")
+        self.wfile.write(data)
+        self.wfile.flush()
 
     def _send_json(self, status_code, payload):
+        """Send JSON response with explicit status code."""
         self.send_response(int(status_code))
         self.send_header("Content-type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(payload).encode('utf-8'))
 
     def _send_error_json(self, status_code, error_type, message, details=None):
+        """Send stable error envelopes so clients can parse failures reliably."""
         payload = _structured_error(error_type, message, status_code=status_code, details=details)
         payload.pop("_status_code", None)
         self._send_json(status_code, payload)
 
-    def _send_400(self, message):
-        self._send_error_json(400, "BadRequest", message)
-        
-    def _send_404(self):
-        self._send_error_json(404, "NotFound", "Path not found")
-
-    def _send_500(self, message):
-        self._send_error_json(500, "ServerError", message)
-
 
 # Helper to run server in its own thread
 def start_mcp_server():
-    """Starts the MCP HTTP server in a thread."""
+    """Start the threaded HTTP server that serves tools, polling, and SSE streaming."""
     global _SERVER
     try:
         # Use a non-default thread class that is properly daemonized
